@@ -1,4 +1,4 @@
-name = "flight"
+name = "flight-deal-intel"
 main = "intel-worker.js"
 compatibility_date = "2026-07-18"
 
@@ -9,14 +9,21 @@ crons = ["0 19 * * *"]
 # ---- KV: response/token cache (short-lived) ----
 [[kv_namespaces]]
 binding = "CACHE"
-id = "917f0d21fa504c6a8c27c06995de1a4c"
+id = "REPLACE_WITH_CACHE_NAMESPACE_ID"
 
 # ---- KV: price history + watchlist + ingested mail (long-lived, keep separate) ----
 [[kv_namespaces]]
 binding = "HISTORY"
-id = "1c354d6ceb034fd38fc6ffa9c7f891a4"
+id = "REPLACE_WITH_HISTORY_NAMESPACE_ID"
 
-# Secrets — set in the dashboard as encrypted Secrets, NOT here:
-#   TRAVELPAYOUTS_TOKEN   (travelpayouts.com → Profile → API token)
-#   GEMINI_API_KEY        (optional — narration layer; falls back to rules without it)
+# ---- Workers AI (optional; delete this block to run rules-only) ----
+[ai]
+binding = "AI"
+
+[vars]
+AMADEUS_ENV = "test"
+
+# Secrets — set in the dashboard, NOT here:
+#   AMADEUS_CLIENT_ID
+#   AMADEUS_CLIENT_SECRET
 #   INGEST_TOKEN          (any long random string, for /api/ingest)
