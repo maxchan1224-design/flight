@@ -1,0 +1,17 @@
+name = "flight"
+main = "worker.js"
+compatibility_date = "2026-07-18"
+
+# Optional but recommended: enables price history, which upgrades deal scoring
+# from "vs these results" to "vs your own recorded history".
+# Create a KV namespace in the dashboard and paste its ID here.
+[[kv_namespaces]]
+binding = "HISTORY"
+id = "PASTE_YOUR_KV_NAMESPACE_ID_HERE"
+
+[vars]
+DEFAULT_MARKET = "hk"
+# TP_MARKER = "123456"   # your Travelpayouts marker, appended to booking links
+
+# Secret — set in the dashboard as an encrypted Secret, NOT here:
+#   TRAVELPAYOUTS_TOKEN
