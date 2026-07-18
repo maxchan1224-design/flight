@@ -7,7 +7,7 @@ compatibility_date = "2026-07-18"
 # Create a KV namespace in the dashboard and paste its ID here.
 [[kv_namespaces]]
 binding = "HISTORY"
-id = "PASTE_YOUR_KV_NAMESPACE_ID_HERE"
+id = "1c354d6ceb034fd38fc6ffa9c7f891a4"
 
 [vars]
 DEFAULT_MARKET = "hk"
