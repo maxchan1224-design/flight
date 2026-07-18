@@ -7,12 +7,17 @@
  * ================================================================
  *
  *  BINDINGS REQUIRED
- *    Secrets:  AMADEUS_CLIENT_ID, AMADEUS_CLIENT_SECRET
- *    Vars:     AMADEUS_ENV = "test" | "production"
- *              INGEST_TOKEN = any long random string (for email ingest)
- *    KV:       CACHE   (token + response cache)
+ *    Secrets:  TRAVELPAYOUTS_TOKEN   (Profile → API token, travelpayouts.com)
+ *              GEMINI_API_KEY        (optional — narration layer; falls back to rules)
+ *    Vars:     INGEST_TOKEN = any long random string (for email ingest)
+ *    KV:       CACHE   (response cache)
  *              HISTORY (price history + feed items — keep separate, it grows)
- *    AI:       AI      (Workers AI, optional — falls back to rules)
+ *
+ *  Data/narration split (do not blur this line):
+ *    - Every price, date, and discount% is computed from Travelpayouts data
+ *      plus our own recorded history. Deterministic code only.
+ *    - Gemini only narrates numbers that scoreDeal() already computed.
+ *      It is never the source of a price.
  *
  *  CRON (wrangler.toml):
  *    [triggers]
@@ -77,39 +82,21 @@ const SCAN_HORIZON_DAYS = 60;     // how far ahead the scanner looks
 const FEED_TTL = 60 * 60 * 3;     // 3h cache on public feeds
 
 /* ================================================================
- * Amadeus
+ * Travelpayouts Data API — one token, no OAuth dance.
+ * Docs: https://travelpayouts.github.io/slate/
+ * Prices are served from a 48h cache of real user searches, not a
+ * live GDS — fine for anomaly detection, not for final booking price.
  * ================================================================ */
 
-const amaBase = (env) =>
-  env.AMADEUS_ENV === "production" ? "https://api.amadeus.com" : "https://test.api.amadeus.com";
+const TP_BASE = "https://api.travelpayouts.com";
 
-async function amaToken(env) {
-  const hit = await env.CACHE.get("ama_token");
-  if (hit) return hit;
-  const r = await fetch(amaBase(env) + "/v1/security/oauth2/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "client_credentials",
-      client_id: env.AMADEUS_CLIENT_ID,
-      client_secret: env.AMADEUS_CLIENT_SECRET,
-    }),
-  });
-  if (!r.ok) throw new Error("Amadeus auth failed: " + r.status);
-  const d = await r.json();
-  await env.CACHE.put("ama_token", d.access_token, { expirationTtl: Math.max(60, (d.expires_in || 1799) - 90) });
-  return d.access_token;
-}
-
-async function amaGet(env, path, params) {
-  const token = await amaToken(env);
-  const u = new URL(amaBase(env) + path);
+async function tpGet(env, path, params) {
+  const u = new URL(TP_BASE + path);
   for (const [k, v] of Object.entries(params)) if (v != null && v !== "") u.searchParams.set(k, String(v));
-  const r = await fetch(u.toString(), { headers: { Authorization: "Bearer " + token } });
+  const r = await fetch(u.toString(), { headers: { "X-Access-Token": env.TRAVELPAYOUTS_TOKEN } });
   const b = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    const msg = (b.errors && b.errors[0] && (b.errors[0].detail || b.errors[0].title)) || ("HTTP " + r.status);
-    throw new Error(msg);
+  if (!r.ok || b.success === false) {
+    throw new Error((b.error && String(b.error)) || "HTTP " + r.status);
   }
   return b;
 }
@@ -200,59 +187,43 @@ function todayISO(offsetDays = 0) {
   return d.toISOString().slice(0, 10);
 }
 
-/** Cheapest round trip on a route within the horizon, via cheapest-date search. */
+/** Cheapest round trip on a route within the horizon, via Travelpayouts. */
 async function probeRoute(env, dest) {
   const route = HOME + "-" + dest;
-  // Try cheapest-date search first (1 call covers the whole window).
+
+  // Primary: month-matrix — one call, a full month of cached cheapest-per-day prices.
   try {
-    const r = await amaGet(env, "/v1/shopping/flight-dates", {
-      origin: HOME, destination: dest, oneWay: false, viewBy: "DATE",
+    const month = todayISO().slice(0, 7) + "-01";
+    const r = await tpGet(env, "/v2/prices/month-matrix", {
+      currency: "hkd", origin: HOME, destination: dest, month, show_to_affiliates: "true",
     });
     const rows = (r.data || [])
-      .map((d) => ({ dep: d.departureDate, ret: d.returnDate, price: parseFloat(d.price && d.price.total) }))
-      .filter((x) => !isNaN(x.price));
+      .map((d) => ({ dep: d.depart_date, ret: d.return_date, price: parseFloat(d.value) }))
+      .filter((x) => x.dep && !isNaN(x.price));
     if (rows.length) {
       rows.sort((a, b) => a.price - b.price);
-      return { route, dest, ok: true, method: "flight-dates",
-        price: rows[0].price, currency: "EUR", bestDepart: rows[0].dep, bestReturn: rows[0].ret };
+      return { route, dest, ok: true, method: "month-matrix",
+        price: rows[0].price, currency: "HKD", bestDepart: rows[0].dep, bestReturn: rows[0].ret };
     }
   } catch (e) { /* fall through */ }
 
-  // Fallback: sample a few concrete weekends with flight-offers (accurate HKD).
-  const samples = [];
-  for (let w = 2; w <= 8; w += 2) {
-    const dep = nextFriday(w * 7);
-    const ret = addDays(dep, 3);
-    samples.push({ dep, ret });
+  // Fallback: latest cached prices for the route (any dates found in the last 48h).
+  try {
+    const r = await tpGet(env, "/v2/prices/latest", {
+      currency: "hkd", origin: HOME, destination: dest, period_type: "year", limit: 30, sorting: "price",
+    });
+    const rows = (r.data || [])
+      .map((d) => ({ dep: d.depart_date, ret: d.return_date, price: parseFloat(d.value) }))
+      .filter((x) => x.dep && !isNaN(x.price));
+    if (rows.length) {
+      rows.sort((a, b) => a.price - b.price);
+      return { route, dest, ok: true, method: "latest-prices",
+        price: rows[0].price, currency: "HKD", bestDepart: rows[0].dep, bestReturn: rows[0].ret };
+    }
+  } catch (e) {
+    return { route, dest, ok: false, reason: e.message };
   }
-  let best = null;
-  for (const s of samples) {
-    try {
-      const r = await amaGet(env, "/v2/shopping/flight-offers", {
-        originLocationCode: HOME, destinationLocationCode: dest,
-        departureDate: s.dep, returnDate: s.ret, adults: 1, currencyCode: "HKD", max: 3,
-      });
-      const p = (r.data || []).map((o) => parseFloat(o.price.grandTotal)).filter((x) => !isNaN(x));
-      if (p.length) {
-        const lo = Math.min(...p);
-        if (!best || lo < best.price) best = { price: lo, bestDepart: s.dep, bestReturn: s.ret };
-      }
-    } catch (e) { /* skip this sample */ }
-  }
-  if (best) return { route, dest, ok: true, method: "flight-offers", currency: "HKD", ...best };
-  return { route, dest, ok: false, reason: "No fares returned" };
-}
-
-function addDays(iso, n) {
-  const d = new Date(iso + "T00:00:00Z");
-  d.setUTCDate(d.getUTCDate() + n);
-  return d.toISOString().slice(0, 10);
-}
-function nextFriday(offsetDays) {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() + offsetDays);
-  d.setUTCDate(d.getUTCDate() + ((5 - d.getUTCDay() + 7) % 7));
-  return d.toISOString().slice(0, 10);
+  return { route, dest, ok: false, reason: "No cached fares for this route yet" };
 }
 
 async function getWatchlist(env) {
@@ -432,23 +403,40 @@ async function briefing(env, scan, feed) {
         " (" + r.score.discountPct + "% vs median)").join("; ") + "."
     : "No scored opportunities yet — the scanner needs at least 5 days of history per route before discounts become meaningful.";
 
-  if (!env.AI) return { text: fallback, source: "rules" };
+  if (!env.GEMINI_API_KEY) return { text: fallback, source: "rules" };
   try {
-    const out = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
-      messages: [{
-        role: "user",
-        content:
-          "You are a flight deal analyst for a Hong Kong traveller. In under 110 words, plain text, no markdown: " +
-          "state the single best opportunity and why, mention any second-best, and say clearly if nothing is worth acting on today. " +
-          "Data: " + JSON.stringify({
-            deals: top.map((r) => ({ dest: r.dest, price: Math.round(r.price), cur: r.currency,
-              discountPct: r.score.discountPct, confidence: r.score.confidence, depart: r.bestDepart })),
-            headlines: (feed.items || []).slice(0, 6).map((i) => i.title),
-          }),
-      }],
-      max_tokens: 260,
-    });
-    return { text: (out && out.response) || fallback, source: "workers-ai" };
+    // Gemini narrates numbers scoreDeal() already computed — it never
+    // originates a price. The prompt hands it a closed set of facts only.
+    const facts = {
+      deals: top.map((r) => ({ dest: r.dest, price: Math.round(r.price), currency: r.currency,
+        discountPct: r.score.discountPct, confidence: r.score.confidence, depart: r.bestDepart })),
+      headlines: (feed.items || []).slice(0, 6).map((i) => i.title),
+    };
+    const prompt =
+      "You are a flight deal analyst for a Hong Kong traveller. Using ONLY the numbers in this JSON " +
+      "(never invent or adjust a price), write under 110 words of plain text, no markdown: state the " +
+      "single best opportunity and why, mention any second-best, and say clearly if nothing is worth " +
+      "acting on today. Data: " + JSON.stringify(facts);
+
+    const r = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" +
+        env.GEMINI_API_KEY,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: 300, temperature: 0.3 },
+        }),
+      }
+    );
+    const body = await r.json();
+    if (!r.ok) throw new Error((body.error && body.error.message) || "HTTP " + r.status);
+    const text =
+      body.candidates && body.candidates[0] && body.candidates[0].content &&
+      body.candidates[0].content.parts && body.candidates[0].content.parts[0] &&
+      body.candidates[0].content.parts[0].text;
+    return { text: (text && text.trim()) || fallback, source: "gemini" };
   } catch (e) {
     return { text: fallback, source: "rules", error: e.message };
   }

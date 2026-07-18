@@ -16,14 +16,7 @@ id = "REPLACE_WITH_CACHE_NAMESPACE_ID"
 binding = "HISTORY"
 id = "REPLACE_WITH_HISTORY_NAMESPACE_ID"
 
-# ---- Workers AI (optional; delete this block to run rules-only) ----
-[ai]
-binding = "AI"
-
-[vars]
-AMADEUS_ENV = "test"
-
-# Secrets — set in the dashboard, NOT here:
-#   AMADEUS_CLIENT_ID
-#   AMADEUS_CLIENT_SECRET
+# Secrets — set in the dashboard as encrypted Secrets, NOT here:
+#   TRAVELPAYOUTS_TOKEN   (travelpayouts.com → Profile → API token)
+#   GEMINI_API_KEY        (optional — narration layer; falls back to rules without it)
 #   INGEST_TOKEN          (any long random string, for /api/ingest)
