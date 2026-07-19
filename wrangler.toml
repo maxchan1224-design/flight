@@ -2,9 +2,17 @@ name = "flight"
 main = "worker.js"
 compatibility_date = "2026-07-18"
 
+# Optional. Enables price history (better deal scoring), airline-name cache,
+# and deal-feed caching. Delete this whole block if you don't want it —
+# the app runs fine without it.
+# [[kv_namespaces]]
+# binding = "HISTORY"
+# id = "PASTE_REAL_KV_NAMESPACE_ID"
+
 [vars]
 DEFAULT_MARKET = "hk"
-# TP_MARKER = "123456"   # your Travelpayouts marker, appended to booking links
+# TP_MARKER = "123456"
 
-# Secret — set in the dashboard as an encrypted Secret, NOT here:
-#   TRAVELPAYOUTS_TOKEN
+# Secrets — set in the dashboard, NOT here:
+#   TRAVELPAYOUTS_TOKEN   (required)
+#   GEMINI_API_KEY        (optional — AI analysis; falls back to rules)
