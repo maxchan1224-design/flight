@@ -237,6 +237,30 @@ async function searchMonth(env, q, nm, month) {
   }));
 }
 
+/**
+ * No fixed date at all — scans cached fares across the whole coming year
+ * and returns the cheapest found, each with its own real date. Also the
+ * mechanism that makes a country-code destination work ("HKG to Japan,
+ * whenever is cheapest" returns real fares to NRT, KIX, FUK etc. mixed
+ * together, sorted by price) — Travelpayouts accepts a 2-letter country
+ * code in the same origin/destination field as a 3-letter airport code.
+ */
+async function searchAnytime(env, q, nm) {
+  const b = await tp(env, "/v2/prices/latest", {
+    origin:q.origin, destination:q.destination||"",
+    currency:q.currency.toLowerCase(), period_type:"year",
+    one_way:q.trip==="return"?"false":"true",
+    page:1, limit:30, sorting:"price", show_to_affiliates:"true", market:q.market,
+  });
+  return (b.data||[]).map(d=>makeOffer({
+    origin:d.origin||q.origin, destination:d.destination||q.destination,
+    departDate:d.depart_date, returnDate:d.return_date||null,
+    price:d.value, currency:q.currency, stops:d.number_of_changes,
+    airlineCode:d.gate||null, airlineName:nm[d.gate]||d.gate||null,
+    via:"any_date", foundVia:"anytime_cache",
+  }));
+}
+
 async function searchLatest(env, q, nm) {
   const b = await tp(env, "/v2/prices/latest", {
     currency:q.currency.toLowerCase(), origin:q.origin, destination:q.destination,
@@ -354,11 +378,15 @@ async function handleSearch(request, env) {
     distance:parseInt(p.get("distance")||"600",10),
     flexible: p.get("flexible")==="1",
     bag: p.get("nobag")!=="1",
+    anyDate: p.get("anyDate")==="1",
     market: env.DEFAULT_MARKET||"hk",
   };
   if (!env.TRAVELPAYOUTS_TOKEN) return json({ error:"TRAVELPAYOUTS_TOKEN not configured" },500);
   if (!q.origin || !q.destination) return json({ error:"origin and destination required" },400);
-  if (!q.departDate) return json({ error:"departDate required" },400);
+  // 2 letters = country code, 3 = city/airport code — both are valid inputs.
+  if (q.origin.length<2 || q.origin.length>3 || q.destination.length<2 || q.destination.length>3)
+    return json({ error:"origin/destination must be a 2-letter country code or 3-letter city/airport code" },400);
+  if (!q.anyDate && !q.departDate) return json({ error:"departDate required (or enable Any date)" },400);
 
   let weights = PROFILES[p.get("profile")] || PROFILES.balanced;
   if (env.HISTORY) {
@@ -374,38 +402,68 @@ async function handleSearch(request, env) {
 
   let pool = [];
 
-  // --- 1. exact dates (richest itinerary data)
-  try { const r = await searchExact(env,q,nm); pool=pool.concat(r); mark("exact_dates",true,r.length); }
-  catch(e){ mark("exact_dates",false,0,e.message); }
+  if (q.anyDate) {
+    // No date requested at all: scan the whole year for the cheapest cached
+    // fares. Also the path that makes a country-code destination work, since
+    // results arrive as a mix of real cities with no single date to fix on.
+    try { const r = await searchAnytime(env,q,nm); pool=pool.concat(r); mark("anytime_cache",true,r.length); }
+    catch(e){ mark("anytime_cache",false,0,e.message); }
 
-  // --- 2. ±3 days around the requested date
-  if (q.flexible || pool.length < 4) {
-    const shifts = [-3,-2,-1,1,2,3];
-    const got = await Promise.all(shifts.map(async s=>{
-      try {
-        return await searchExact(env,q,nm,{
-          departDate: addDays(q.departDate,s),
-          returnDate: q.returnDate ? addDays(q.returnDate,s) : "",
-          via:"other_date" });
-      } catch(e){ return []; }
-    }));
-    const flat = got.flat(); pool = pool.concat(flat); mark("flex_dates",true,flat.length);
-  }
+    // Nearby-airport comparison still needs SOME concrete date to query
+    // against. Best-effort: probe using the cheapest date already found.
+    // Never fatal if it fails — the anytime results stand on their own.
+    if (q.destination.length===3) {
+      const probeDate = pool.length ? pool.slice().sort((a,b)=>a.price-b.price)[0].departDate : null;
+      if (probeDate) {
+        try {
+          const r = await searchNearby(env, { ...q, departDate:probeDate, returnDate:"" }, nm);
+          // Keep only genuine alternatives. The exact origin/destination row
+          // from this probe reflects one arbitrary date, not the year-wide
+          // scan, and would otherwise show up as a confusing near-duplicate
+          // alongside the real any-date results for the same route.
+          const alts = r.filter(o=>o.via!=="requested");
+          pool = pool.concat(alts); mark("nearby_airports",true,alts.length);
+        } catch(e){ mark("nearby_airports",false,0,e.message); }
+      } else {
+        mark("nearby_airports",false,0,"no_probe_date_available");
+      }
+    } else {
+      mark("nearby_airports",false,0,"destination_is_a_country_not_a_single_airport");
+    }
+  } else {
+    // --- 1. exact dates (richest itinerary data)
+    try { const r = await searchExact(env,q,nm); pool=pool.concat(r); mark("exact_dates",true,r.length); }
+    catch(e){ mark("exact_dates",false,0,e.message); }
 
-  // --- 3. month calendar
-  if (pool.length < 8) {
-    try { const r = await searchMonth(env,q,nm,q.departDate.slice(0,7)); pool=pool.concat(r); mark("month_calendar",true,r.length); }
-    catch(e){ mark("month_calendar",false,0,e.message); }
-  }
+    // --- 2. ±3 days around the requested date
+    if (q.flexible || pool.length < 4) {
+      const shifts = [-3,-2,-1,1,2,3];
+      const got = await Promise.all(shifts.map(async s=>{
+        try {
+          return await searchExact(env,q,nm,{
+            departDate: addDays(q.departDate,s),
+            returnDate: q.returnDate ? addDays(q.returnDate,s) : "",
+            via:"other_date" });
+        } catch(e){ return []; }
+      }));
+      const flat = got.flat(); pool = pool.concat(flat); mark("flex_dates",true,flat.length);
+    }
 
-  // --- 4. nearby airports
-  try { const r = await searchNearby(env,q,nm); pool=pool.concat(r); mark("nearby_airports",true,r.filter(o=>o.via!=="requested").length); }
-  catch(e){ mark("nearby_airports",false,0,e.message); }
+    // --- 3. month calendar
+    if (pool.length < 8) {
+      try { const r = await searchMonth(env,q,nm,q.departDate.slice(0,7)); pool=pool.concat(r); mark("month_calendar",true,r.length); }
+      catch(e){ mark("month_calendar",false,0,e.message); }
+    }
 
-  // --- 5. last resort: anything cached on this route at all
-  if (!pool.length) {
-    try { const r = await searchLatest(env,q,nm); pool=pool.concat(r); mark("recent_cache",true,r.length); }
-    catch(e){ mark("recent_cache",false,0,e.message); }
+    // --- 4. nearby airports
+    try { const r = await searchNearby(env,q,nm); pool=pool.concat(r); mark("nearby_airports",true,r.filter(o=>o.via!=="requested").length); }
+    catch(e){ mark("nearby_airports",false,0,e.message); }
+
+    // --- 5. last resort: anything cached on this route at all
+    if (!pool.length) {
+      try { const r = await searchLatest(env,q,nm); pool=pool.concat(r); mark("recent_cache",true,r.length); }
+      catch(e){ mark("recent_cache",false,0,e.message); }
+    }
   }
 
   // dedupe + trip-type filter
@@ -583,9 +641,11 @@ async function handlePlaces(request) {
   const t=new URL(request.url).searchParams.get("q")||"";
   if (t.length<2) return json({ places:[] });
   try {
-    const r=await fetch("https://autocomplete.travelpayouts.com/places2?locale=en&types[]=city&types[]=airport&term="+encodeURIComponent(t));
+    const r=await fetch("https://autocomplete.travelpayouts.com/places2?locale=en&types[]=city&types[]=airport&types[]=country&term="+encodeURIComponent(t));
     const l=await r.json();
-    return json({ places:(l||[]).slice(0,8).map(x=>({ code:x.code,name:x.name,country:x.country_name })) });
+    return json({ places:(l||[]).slice(0,10).map(x=>({
+      code:x.code, name:x.name, country:x.country_name, type:x.type,
+    })) });
   } catch(e){ return json({ places:[] }); }
 }
 
@@ -788,7 +848,7 @@ details.tr[open] summary:before{content:'▾ '}
     <div class="ac"><label data-i="from">出發</label><input id="o" placeholder="HKG" autocomplete="off"><div class="acl" id="ao"></div></div>
     <div class="ac"><label data-i="to">目的地</label><input id="d" placeholder="TPE" autocomplete="off"><div class="acl" id="ad"></div></div>
   </div>
-  <div class="rw c2">
+  <div class="rw c2" id="dateRow">
     <div><label data-i="dep">去程</label><input id="dd" type="date"></div>
     <div id="rw"><label data-i="retd">回程</label><input id="rd" type="date"></div>
   </div>
@@ -797,7 +857,8 @@ details.tr[open] summary:before{content:'▾ '}
     <div><label data-i="pax">人數</label><select id="px"><option>1</option><option>2</option><option>3</option><option>4</option></select></div>
     <div><label data-i="rad">附近機場</label><select id="ds"><option value="0" data-i="off">唔使</option><option value="400">400 km</option><option value="600" selected>600 km</option><option value="1000">1000 km</option></select></div>
   </div>
-  <div class="opt"><label><input type="checkbox" id="fx" checked> <span data-i="flex">前後 3 日都睇埋</span></label>
+  <div class="opt"><label><input type="checkbox" id="ad"> <span data-i="anyd">唔限日期 · 搵全年最平</span></label></div>
+  <div class="opt" id="dateOpts"><label><input type="checkbox" id="fx" checked> <span data-i="flex">前後 3 日都睇埋</span></label>
   <label><input type="checkbox" id="bg" checked> <span data-i="bag">要寄艙行李</span></label></div>
   <button class="go" id="go" data-i="search">搵機票</button>
 </div>
@@ -830,7 +891,8 @@ var $=function(i){return document.getElementById(i)};
 var UID=(function(){try{var k=localStorage.getItem('fd_uid');if(!k){k='u'+Math.random().toString(36).slice(2,9);localStorage.setItem('fd_uid',k)}return k}catch(e){return'anon'}})();
 var L={zh:{
  ret:'來回',one:'單程',from:'出發',to:'目的地',dep:'去程',retd:'回程',cur:'貨幣',pax:'人數',
- rad:'附近機場',off:'唔使',flex:'前後 3 日都睇埋',bag:'要寄艙行李',search:'搵機票',settings:'⚙︎ 我嘅取向',
+ rad:'附近機場',off:'唔使',flex:'前後 3 日都睇埋',bag:'要寄艙行李',anyd:'唔限日期 · 搵全年最平',search:'搵機票',settings:'⚙︎ 我嘅取向',
+ place_country:'國家',place_city:'城市',place_airport:'機場',any_date:'搵到嘅日期',
  p1:'背包客',p2:'平衡',p3:'家庭',p4:'公幹',gtitle:'附近機場交通成本(自己填)',gadd:'加入',
  searching:'搵緊…',
  h_rec:'建議',h_res:'航班選擇',h_sav:'仲有更平嘅方法',h_ctx:'價錢參考',h_trust:'資料來源',
@@ -853,7 +915,8 @@ var L={zh:{
  yes:'肯',no:'唔肯'
 },en:{
  ret:'Round trip',one:'One way',from:'From',to:'To',dep:'Depart',retd:'Return',cur:'Currency',pax:'Travellers',
- rad:'Nearby airports',off:'Off',flex:'Include ±3 days',bag:'Need checked bag',search:'Find flights',settings:'⚙︎ My preferences',
+ rad:'Nearby airports',off:'Off',flex:'Include ±3 days',bag:'Need checked bag',anyd:'Any date · find cheapest all year',search:'Find flights',settings:'⚙︎ My preferences',
+ place_country:'Country',place_city:'City',place_airport:'Airport',any_date:'Found date',
  p1:'Backpacker',p2:'Balanced',p3:'Family',p4:'Business',gtitle:'Ground transport cost (your own)',gadd:'Add',
  searching:'Searching…',
  h_rec:'Recommended',h_res:'Flight options',h_sav:'Cheaper ways to do this',h_ctx:'Price context',h_trust:'Sources',
@@ -887,16 +950,18 @@ for(var i=0;i<tb.length;i++)tb[i].onclick=function(){for(var j=0;j<tb.length;j++
 var pb=document.querySelectorAll('.pf button');
 for(var i=0;i<pb.length;i++)pb[i].onclick=function(){for(var j=0;j<pb.length;j++)pb[j].className='';this.className='on';prof=this.getAttribute('data-p');sp()};
 
+function placeTypeLabel(t){if(t==='country')return T('place_country');if(t==='city')return T('place_city');return T('place_airport')}
 function ac(inp,list){var I=$(inp),Ls=$(list),tm;
  I.addEventListener('input',function(){var v=I.value.trim();clearTimeout(tm);
   if(v.length<2){Ls.className='acl';return}
   tm=setTimeout(function(){fetch('/api/places?q='+encodeURIComponent(v)).then(function(r){return r.json()}).then(function(x){
    if(!x.places||!x.places.length){Ls.className='acl';return}
    Ls.innerHTML='';x.places.forEach(function(p){var e=document.createElement('div');e.className='aci';
-    e.innerHTML='<b>'+p.code+'</b> '+p.name+'<small>'+(p.country||'')+'</small>';
+    e.innerHTML='<b>'+p.code+'</b> '+p.name+(p.type==='country'?' · '+placeTypeLabel('country'):'')+
+     '<small>'+(p.type!=='country'?(p.country||''):(lang==='zh'?'包晒全國機場':'covers every airport in the country'))+'</small>';
     e.addEventListener('mousedown',function(ev){ev.preventDefault();I.value=p.code;Ls.className='acl'});
     Ls.appendChild(e)});Ls.className='acl on'})},250)});
- I.addEventListener('blur',function(){setTimeout(function(){Ls.className='acl'},170})}
+ I.addEventListener('blur',function(){setTimeout(function(){Ls.className='acl'},170)})}
 ac('o','ao');ac('d','ad');
 
 fetch('/api/prefs?uid='+UID).then(function(r){return r.json()}).then(function(x){QZ=x.quiz||[];
@@ -931,14 +996,16 @@ function dur(m){if(!m)return null;return T('dur',{h:Math.floor(m/60),m:m%60})}
 
 $('go').onclick=function(){
  var o=$('o').value.trim().toUpperCase(),d=$('d').value.trim().toUpperCase();
- if(o.length!==3||d.length!==3){setS('IATA',true);return}
- if(!$('dd').value){setS('date',true);return}
- var p=new URLSearchParams();p.set('uid',UID);p.set('origin',o);p.set('destination',d);
- p.set('trip',trip);p.set('departDate',$('dd').value);
- if(trip==='return'&&$('rd').value)p.set('returnDate',$('rd').value);
+ var codeOk=function(c){return c.length===2||c.length===3};
+ if(!codeOk(o)||!codeOk(d)){setS(lang==='zh'?'請輸入 2-3 個字母嘅代碼(機場/城市/國家)':'Enter a 2-3 letter code (airport, city, or country)',true);return}
+ var anyD=$('ad').checked;
+ if(!anyD&&!$('dd').value){setS('date',true);return}
+ var p=new URLSearchParams();p.set('uid',UID);p.set('origin',o);p.set('destination',d);p.set('trip',trip);
+ if(anyD){p.set('anyDate','1')}
+ else{p.set('departDate',$('dd').value);if(trip==='return'&&$('rd').value)p.set('returnDate',$('rd').value);
+  if($('fx').checked)p.set('flexible','1')}
  p.set('currency',$('cu').value);p.set('pax',$('px').value);
  p.set('distance',$('ds').value);p.set('profile',prof);
- if($('fx').checked)p.set('flexible','1');
  if(!$('bg').checked)p.set('nobag','1');
  setS(T('searching'));$('go').disabled=true;$('out').innerHTML='';
  fetch('/api/search?'+p.toString()).then(function(r){return r.json()}).then(function(x){
