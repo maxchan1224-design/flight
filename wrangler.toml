@@ -2,13 +2,6 @@ name = "flight"
 main = "worker.js"
 compatibility_date = "2026-07-18"
 
-# Optional. Enables price history (better deal scoring), airline-name cache,
-# and deal-feed caching. Delete this whole block if you don't want it —
-# the app runs fine without it.
-# [[kv_namespaces]]
-# binding = "HISTORY"
-# id = "1c354d6ceb034fd38fc6ffa9c7f891a4"
-
 [vars]
 DEFAULT_MARKET = "hk"
 # TP_MARKER = "123456"
