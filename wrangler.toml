@@ -7,7 +7,7 @@ compatibility_date = "2026-07-18"
 # the app runs fine without it.
 # [[kv_namespaces]]
 # binding = "HISTORY"
-# id = "PASTE_REAL_KV_NAMESPACE_ID"
+# id = "1c354d6ceb034fd38fc6ffa9c7f891a4"
 
 [vars]
 DEFAULT_MARKET = "hk"
