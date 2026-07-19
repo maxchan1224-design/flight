@@ -1,11 +1,19 @@
 name = "flight"
 main = "worker.js"
-compatibility_date = "2026-07-18"
+compatibility_date = "2026-07-19"
+
+# KV is strongly recommended here — it stores your preference quiz answers,
+# your ground-transport costs, and the price history the Opportunity Radar
+# needs. Without it the app still runs, but the radar can never leave
+# "insufficient data" and your settings won't persist.
+# [[kv_namespaces]]
+# binding = "HISTORY"
+# id = "PASTE_REAL_KV_NAMESPACE_ID"
 
 [vars]
 DEFAULT_MARKET = "hk"
 # TP_MARKER = "123456"
 
-# Secrets — set in the dashboard, NOT here:
+# Secrets — dashboard only, never in this file:
 #   TRAVELPAYOUTS_TOKEN   (required)
-#   GEMINI_API_KEY        (optional — AI analysis; falls back to rules)
+#   GEMINI_API_KEY        (optional — narration; falls back to plain arithmetic)
