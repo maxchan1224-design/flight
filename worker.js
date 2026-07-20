@@ -464,6 +464,7 @@ async function handleSearch(request, env) {
     flexible: p.get("flexible")==="1",
     bag: p.get("nobag")!=="1",
     anyDate: p.get("anyDate")==="1",
+    dateMode: p.get("dateMode")||null,
     market: env.DEFAULT_MARKET||"hk",
   };
   if (!env.TRAVELPAYOUTS_TOKEN) return json({ error:"TRAVELPAYOUTS_TOKEN not configured" },500);
@@ -550,6 +551,21 @@ async function handleSearch(request, env) {
       try { const r = await searchLatest(env,q,nm); pool=pool.concat(r); mark("recent_cache",true,r.length); }
       catch(e){ mark("recent_cache",false,0,e.message); }
     }
+  }
+
+  // weekend dateMode: keep only Fri/Sat out, Sun/Mon back, 2-4 days (holiday-adjacent also passes)
+  if (q.anyDate && q.dateMode==="weekend") {
+    HOLIDAYS_ACTIVE=await getHolidays(env);
+    pool=pool.filter(o=>{
+      if(!o.departDate||!o.returnDate) return false;
+      const dw=weekday(o.departDate),rw=weekday(o.returnDate),days=tripDays(o.departDate,o.returnDate);
+      const wk=(dw===5||dw===6)&&(rw===0||rw===1)&&days>=2&&days<=4;
+      return wk||nearHoliday(o.departDate)||nearHoliday(o.returnDate);
+    });
+  }
+  if (q.anyDate && q.dateMode==="month") {
+    const thisMonth=new Date().toISOString().slice(0,7);
+    pool=pool.filter(o=>o.departDate&&o.departDate.slice(0,7)===thisMonth);
   }
 
   // dedupe + trip-type filter
@@ -644,6 +660,25 @@ async function handleSearch(request, env) {
   const estimate = buildEstimate(routeFares, history);
   const answer = buildAnswer(q, primary, onRouteOtherDates, altAirports, recommendation, context, estimate);
 
+  // Alternative destinations when the request itself came up empty — the
+  // assistant never stops helping. One extra call, only on the empty tiers.
+  if (answer && (answer.kind==="estimate_only"||answer.kind==="action_plan")) {
+    try{
+      const ab=await tp(env,"/v2/prices/latest",{origin:q.origin,
+        currency:q.currency.toLowerCase(),period_type:"year",one_way:"false",
+        page:1,limit:30,sorting:"price",show_to_affiliates:"true",market:q.market});
+      const seen2=new Set([q.destination]);
+      answer.alternatives=[];
+      for(const d of (ab.data||[])){
+        if(!d.destination||d.value==null||seen2.has(d.destination))continue;
+        seen2.add(d.destination);
+        answer.alternatives.push({destination:d.destination,price:Math.round(d.value),
+          departDate:d.depart_date,returnDate:d.return_date||null});
+        if(answer.alternatives.length>=3)break;
+      }
+    }catch(e){ answer.alternatives=[]; }
+  }
+
   // verification links — a footnote for checking, never the product's output
   const fallbackLinks = [];
   {
@@ -669,6 +704,19 @@ async function handleSearch(request, env) {
     verifyLinks: fallbackLinks,
     trust: {
       sources,
+      sourceInventory: [
+        {id:"travelpayouts", role:"core_prices", status:"live"},
+        {id:"reddit", role:"community_signals", status:"live"},
+        {id:"telegram_channels", role:"promo_signals", status: env.TG_CHANNELS?"live":"configure_TG_CHANNELS"},
+        {id:"airline_rss", role:"promo_signals", status: env.RSS_FEEDS?"live":"configure_RSS_FEEDS"},
+        {id:"newsletter_ingest", role:"promo_signals", status:"live_via_/api/ingest"},
+        {id:"public_holidays_api", role:"context", status:"live_nager.date"},
+        {id:"duffel", role:"core_prices_v2", status: env.DUFFEL_KEY?"live":"needs_DUFFEL_KEY_paid"},
+        {id:"aviationstack", role:"enrichment_v2", status: env.AVIATIONSTACK_KEY?"live":"needs_key"},
+        {id:"openweather", role:"context_v2", status: env.OPENWEATHER_KEY?"live":"needs_key"},
+        {id:"flyday_flyagain", role:"deal_signals", status:"manual_links_no_api"},
+        {id:"facebook_ig_threads", role:"promo_signals", status:"no_legal_api_disclosure_only"},
+      ],
       unavailable: [
         { id:"google_flights_api", en:"Google Flights has no public API", zh:"Google Flights 冇公開 API" },
         { id:"tripcom_api", en:"Trip.com / Expedia have no public API", zh:"Trip.com / Expedia 冇公開 API" },
@@ -726,6 +774,100 @@ async function handleGround(request, env) {
   }
   if (env.HISTORY) await env.HISTORY.put("ground:"+uid, JSON.stringify(cur));
   return json({ ok:true, ground:cur });
+}
+
+
+/* ================================================================
+ * WATCHLIST + TARGET PRICE (Personal Intelligence layer)
+ * ================================================================ */
+async function handleWatch(request, env) {
+  const u=new URL(request.url), uid=u.searchParams.get("uid")||"anon";
+  const key="watch:"+uid;
+  const cur=(env.HISTORY&&await env.HISTORY.get(key,"json"))||[];
+  if(request.method==="GET"){
+    // enrich with current cheapest from the cached feed where available
+    let feed=null;
+    if(env.HISTORY){ feed=await env.HISTORY.get("feed:"+ (u.searchParams.get("origin")||"HKG") +":"+(u.searchParams.get("currency")||"HKD"),"json"); }
+    const deals=feed&&feed.deals?feed.deals:[];
+    const out=cur.map(w=>{
+      const d=deals.find(x=>x.destination===w.destination&&x.origin===w.origin);
+      return {...w, currentPrice:d?d.price:null, currentDate:d?d.departDate:null,
+        reached: d&&w.target!=null ? d.price<=w.target : false};
+    });
+    return json({watch:out});
+  }
+  const b=await request.json().catch(()=>({}));
+  if(b.remove){ const nx=cur.filter(w=>!(w.origin===b.origin&&w.destination===b.destination));
+    if(env.HISTORY)await env.HISTORY.put(key,JSON.stringify(nx)); return json({ok:true,watch:nx}); }
+  if(b.origin&&b.destination){
+    const nx=cur.filter(w=>!(w.origin===b.origin&&w.destination===b.destination));
+    nx.push({origin:b.origin.toUpperCase(),destination:b.destination.toUpperCase(),
+      target:b.target!=null?Math.round(b.target):null,addedAt:new Date().toISOString().slice(0,10)});
+    if(nx.length>20)nx.shift();
+    if(env.HISTORY)await env.HISTORY.put(key,JSON.stringify(nx));
+    return json({ok:true,watch:nx});
+  }
+  return json({error:"origin and destination required"},400);
+}
+
+/* ================================================================
+ * PUBLIC HOLIDAYS — live API (Nager.Date, free, keyless) with the
+ * static 2026 HK table as offline fallback. Cached 7 days.
+ * ================================================================ */
+async function getHolidays(env) {
+  const country=env.HOLIDAY_COUNTRY||"HK";
+  const year=new Date().getUTCFullYear();
+  const key="hol:"+country+":"+year;
+  if(env.HISTORY){const c=await env.HISTORY.get(key,"json"); if(c)return c;}
+  try{
+    const r=await fetch("https://date.nager.at/api/v3/PublicHolidays/"+year+"/"+country);
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    const list=(await r.json()).map(h=>h.date);
+    if(list.length){ if(env.HISTORY)await env.HISTORY.put(key,JSON.stringify(list),{expirationTtl:604800}); return list; }
+  }catch(e){}
+  return HK_HOLIDAYS_2026;
+}
+
+/* ================================================================
+ * PROMO INTELLIGENCE INGEST
+ *  - /api/ingest : airline newsletter emails (via Cloudflare Email
+ *    Routing worker or manual POST) → signals store
+ *  - RSS + Telegram public channels, configured via env vars:
+ *      RSS_FEEDS="https://airline1.com/rss,https://..."
+ *      TG_CHANNELS="cathaydeals,hkflightdeals"
+ * ================================================================ */
+async function handleIngest(request, env) {
+  const b=await request.json().catch(()=>({}));
+  if(!b.subject&&!b.title) return json({error:"subject or title required"},400);
+  const sig={source:b.source||"newsletter",title:(b.subject||b.title).slice(0,180),
+    url:b.url||null,ts:Date.now(),body:(b.body||"").slice(0,300)};
+  if(env.HISTORY){
+    const key="ingested:signals";
+    const cur=(await env.HISTORY.get(key,"json"))||[];
+    cur.unshift(sig); if(cur.length>50)cur.pop();
+    await env.HISTORY.put(key,JSON.stringify(cur));
+  }
+  return json({ok:true,stored:sig.title});
+}
+
+async function monitoredFeeds(env) {
+  const out=[];
+  const rss=(env.RSS_FEEDS||"").split(",").map(x=>x.trim()).filter(Boolean).slice(0,5);
+  const tgs=(env.TG_CHANNELS||"").split(",").map(x=>x.trim()).filter(Boolean).slice(0,5);
+  await Promise.all([
+    ...rss.map(async u2=>{try{
+      const r=await fetch(u2); if(!r.ok)return; const t=await r.text();
+      const items=[...t.matchAll(/<item>[\s\S]*?<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>[\s\S]*?<link>([\s\S]*?)<\/link>/g)].slice(0,5);
+      for(const m of items) out.push({source:"rss",title:m[1].trim().slice(0,180),url:m[2].trim(),ts:Date.now()});
+    }catch(e){}}),
+    ...tgs.map(async ch=>{try{
+      const r=await fetch("https://t.me/s/"+ch); if(!r.ok)return; const t=await r.text();
+      const items=[...t.matchAll(/<div class="tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/g)].slice(-4);
+      for(const m of items){const txt=m[1].replace(/<[^>]+>/g," ").replace(/\s+/g," ").trim();
+        if(txt)out.push({source:"t.me/"+ch,title:txt.slice(0,180),url:"https://t.me/s/"+ch,ts:Date.now()});}
+    }catch(e){}}),
+  ]);
+  return out;
 }
 
 async function handlePlaces(request) {
@@ -849,7 +991,11 @@ async function communitySignals(env, origin) {
     if(!prev) seen.set(k,{...x,score,alsoSeenIn:[]});
     else if(prev.source!==x.source&&!prev.alsoSeenIn.includes(x.source)){prev.alsoSeenIn.push(x.source);prev.score+=1;}
   }
-  const out=[...seen.values()].sort((a,b)=>b.score-a.score||b.ts-a.ts).slice(0,10);
+  let out=[...seen.values()];
+  try{ const mon=await monitoredFeeds(env); out=out.concat(mon.map(m=>({...m,score:6}))); }catch(e){}
+  if(env.HISTORY){ const ing=(await env.HISTORY.get("ingested:signals","json"))||[];
+    out=out.concat(ing.map(m=>({...m,score:8,source:m.source||"newsletter"}))); }
+  out=out.sort((a,b)=>b.score-a.score||b.ts-a.ts).slice(0,14);
   if(env.HISTORY) await env.HISTORY.put(key,JSON.stringify(out),{expirationTtl:10800});
   return out;
 }
@@ -966,8 +1112,9 @@ const HK_HOLIDAYS_2026=["2026-01-01","2026-02-17","2026-02-18","2026-02-19",
 
 function weekday(iso){ return new Date(iso+"T00:00:00Z").getUTCDay(); } // 0=Sun..6=Sat
 function tripDays(a,b){ return Math.round((new Date(b)-new Date(a))/86400000); }
+let HOLIDAYS_ACTIVE=HK_HOLIDAYS_2026;
 function nearHoliday(iso){
-  for(const h of HK_HOLIDAYS_2026){
+  for(const h of HOLIDAYS_ACTIVE){
     const d=Math.abs(Math.round((new Date(iso)-new Date(h))/86400000));
     if(d<=1) return h;
   }
@@ -975,6 +1122,7 @@ function nearHoliday(iso){
 }
 
 async function handleInspire(request, env) {
+  HOLIDAYS_ACTIVE=await getHolidays(env);
   const p=new URL(request.url).searchParams;
   const origin=(p.get("origin")||"HKG").toUpperCase().trim();
   const currency=(p.get("currency")||"HKD").toUpperCase();
@@ -1040,6 +1188,8 @@ export default {
     try {
       if (p==="/api/search") return await handleSearch(request, env);
       if (p==="/api/feed") return await handleFeed(request, env);
+      if (p==="/api/watch") return await handleWatch(request, env);
+      if (p==="/api/ingest" && request.method==="POST") return await handleIngest(request, env);
       if (p==="/api/inspire") return await handleInspire(request, env);
       if (p==="/api/prefs") return await handlePrefs(request, env);
       if (p==="/api/ground") return await handleGround(request, env);
@@ -1082,9 +1232,12 @@ header{display:flex;align-items:center;justify-content:space-between;padding:4px
 .lang{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
 .lang button{background:none;border:none;color:var(--dim);padding:5px 10px;font-size:.76rem;cursor:pointer;font-family:var(--f)}
 .lang button.on{background:var(--card2);color:var(--tx);font-weight:600}
-.jt{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-bottom:14px}
-.jt button{background:var(--card);border:1px solid var(--line);color:var(--dim);border-radius:11px;padding:12px 4px;font-size:.8rem;cursor:pointer;font-family:var(--f);display:flex;flex-direction:column;align-items:center;gap:3px}
-.jt button.on{border-color:var(--acc);color:var(--acc);background:var(--card2);font-weight:600}
+.jt{position:fixed;bottom:0;left:0;right:0;z-index:90;display:grid;grid-template-columns:repeat(4,1fr);gap:0;background:rgba(13,17,23,.97);border-top:1px solid var(--line);padding:6px 8px calc(8px + env(safe-area-inset-bottom))}
+.jt button{background:none;border:none;color:var(--dim);padding:7px 2px;font-size:.68rem;cursor:pointer;font-family:var(--f);display:flex;flex-direction:column;align-items:center;gap:2px}
+.jt button.on{color:var(--acc);font-weight:600}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.chips button{background:var(--bg);border:1px solid var(--line);color:var(--dim);border-radius:18px;padding:8px 14px;font-size:.78rem;cursor:pointer;font-family:var(--f)}
+.chips button.on{border-color:var(--acc);color:var(--acc);background:var(--card2);font-weight:600}
 .jt .ji{font-size:1.15rem}
 .vd{background:linear-gradient(180deg,#12261a,#161b22);border:1px solid var(--acc);border-radius:12px;padding:15px;margin-bottom:12px}
 .vd .vl{font-size:.62rem;color:var(--acc);letter-spacing:.14em;text-transform:uppercase;font-weight:700;margin-bottom:7px}
@@ -1189,9 +1342,10 @@ details.tr[open] summary:before{content:'▾ '}
 <div class="lang"><button id="lz" class="on">繁中</button><button id="le">EN</button></div></header>
 
 <div class="jt">
-  <button class="on" data-j="j1"><span class="ji">🔥</span><span data-i="j1">今日筍盤</span></button>
-  <button data-j="j2"><span class="ji">🎯</span><span data-i="j2">目的地研究</span></button>
-  <button data-j="j3"><span class="ji">🎲</span><span data-i="j3">去邊好</span></button>
+  <button class="on" data-j="j1"><span class="ji">🔥</span><span data-i="j1">發現</span></button>
+  <button data-j="j2"><span class="ji">🎯</span><span data-i="j2">研究</span></button>
+  <button data-j="j3"><span class="ji">🎲</span><span data-i="j3">靈感</span></button>
+  <button data-j="j4"><span class="ji">⭐</span><span data-i="j4">關注</span></button>
 </div>
 
 <!-- ============ JOURNEY 1: DEAL DISCOVERY — zero input ============ -->
@@ -1221,7 +1375,13 @@ details.tr[open] summary:before{content:'▾ '}
     <div><label data-i="pax">人數</label><select id="px"><option>1</option><option>2</option><option>3</option><option>4</option></select></div>
     <div><label data-i="rad">附近機場</label><select id="ds"><option value="0" data-i="off">唔使</option><option value="400">400 km</option><option value="600" selected>600 km</option><option value="1000">1000 km</option></select></div>
   </div>
-  <div class="opt"><label><input type="checkbox" id="ad"> <span data-i="anyd">唔限日期 · 搵全年最平</span></label></div>
+  <div class="chips" id="dchips">
+    <button data-dm="exact" class="on" data-i="c_exact">指定日期</button>
+    <button data-dm="any" data-i="c_any">唔限日期</button>
+    <button data-dm="month" data-i="c_month">今個月</button>
+    <button data-dm="weekend" data-i="c_wknd">週末</button>
+  </div>
+  <input type="checkbox" id="ad" style="display:none">
   <div class="opt" id="dateOpts"><label><input type="checkbox" id="fx" checked> <span data-i="flex">前後 3 日都睇埋</span></label>
   <label><input type="checkbox" id="bg" checked> <span data-i="bag">要寄艙行李</span></label></div>
   <button class="go" id="go" data-i="search">搵機票</button>
@@ -1245,6 +1405,11 @@ details.tr[open] summary:before{content:'▾ '}
   </div>
   <div class="st" id="i-st"></div>
   <div id="i-out"></div>
+</section>
+
+<section id="j4" class="hidden">
+  <div class="st" id="w-st"></div>
+  <div id="w-out"></div>
 </section>
 
 <details class="set" id="setbox"><summary style="cursor:pointer;font-size:.8rem;color:var(--dim);list-style:none" data-i="settings">⚙︎ 我嘅取向</summary>
@@ -1288,7 +1453,9 @@ var L={zh:{
  a_est_only:'你指定嗰日冇快取價 — 唔等於冇航班。',
  a_plan:'呢條線今年冇任何快取數據。建議改用附近大機場,或者用國家代碼(如 JP)搵全國最平入口。',
  a_now:'✅ 而家買 — 喺你紀錄嘅第 {p} 百分位',a_wait:'⏳ 可以等 — 高過平時',a_nohist:'📊 未有足夠歷史,用估價做參考',
- a_verify:'落單前核實:',
+ a_verify:'落單前核實:',a_alts:'或者考慮:',
+ c_exact:'指定日期',c_any:'唔限日期',c_month:'今個月',c_wknd:'週末',
+ w_add:'關注呢條線',w_added:'已加入關注',w_none:'未有關注航線。喺研究結果撳「⭐ 關注」就會出現喺度。',w_reached:'到咗你目標價!',w_target:'目標價',w_now:'而家',j4:'關注',
  vd_go:'去研究呢條線 →',
  ret:'來回',one:'單程',from:'出發',to:'目的地',dep:'去程',retd:'回程',cur:'貨幣',pax:'人數',
  rad:'附近機場',off:'唔使',flex:'前後 3 日都睇埋',bag:'要寄艙行李',anyd:'唔限日期 · 搵全年最平',search:'搵機票',settings:'⚙︎ 我嘅取向',
@@ -1330,7 +1497,9 @@ var L={zh:{
  a_est_only:'No cached fare for your exact date — that does not mean no flights.',
  a_plan:'Zero cached data on this route this year. Try a nearby major airport, or a country code (e.g. JP) to find the cheapest gateway.',
  a_now:'✅ Buy now — {p}th percentile of your history',a_wait:'⏳ Can wait — above the usual range',a_nohist:'📊 Not enough history; using the estimate as reference',
- a_verify:'Verify before paying:',
+ a_verify:'Verify before paying:',a_alts:'Or consider:',
+ c_exact:'Exact dates',c_any:'Anytime',c_month:'This month',c_wknd:'Weekend',
+ w_add:'Watch this route',w_added:'Watching',w_none:'No watched routes yet. Tap ⭐ Watch on any research result.',w_reached:'Hit your target!',w_target:'Target',w_now:'Now',j4:'Watchlist',
  vd_go:'Research this route →',
  ret:'Round trip',one:'One way',from:'From',to:'To',dep:'Depart',retd:'Return',cur:'Currency',pax:'Travellers',
  rad:'Nearby airports',off:'Off',flex:'Include ±3 days',bag:'Need checked bag',anyd:'Any date · find cheapest all year',search:'Find flights',settings:'⚙︎ My preferences',
@@ -1371,7 +1540,9 @@ for(var i=0;i<jb.length;i++)jb[i].onclick=function(){
  $('j1').className=curJ==='j1'?'':'hidden';
  $('j2').className=curJ==='j2'?'':'hidden';
  $('j3').className=curJ==='j3'?'':'hidden';
+ $('j4').className=curJ==='j4'?'':'hidden';
  if(curJ==='j1'&&!feedLoaded)loadFeed();
+ if(curJ==='j4')loadWatch();
 };
 
 /* ---- JOURNEY 1: deal feed, loads itself ---- */
@@ -1542,7 +1713,7 @@ function ac(inp,list){var I=$(inp),Ls=$(list),tm;
    Ls.innerHTML='';x.places.forEach(function(p){var e=document.createElement('div');e.className='aci';
     e.innerHTML='<b>'+p.code+'</b> '+p.name+(p.type==='country'?' · '+placeTypeLabel('country'):'')+
      '<small>'+(p.type!=='country'?(p.country||''):(lang==='zh'?'包晒全國機場':'covers every airport in the country'))+'</small>';
-    e.addEventListener('mousedown',function(ev){ev.preventDefault();I.value=p.code;Ls.className='acl'});
+    e.addEventListener('mousedown',function(ev){ev.preventDefault();I.value=p.name+' ('+p.code+')';Ls.className='acl'});
     Ls.appendChild(e)});Ls.className='acl on'})},250)});
  I.addEventListener('blur',function(){setTimeout(function(){Ls.className='acl'},170)})}
 ac('o','ao');ac('d','ad');
@@ -1578,13 +1749,12 @@ function hhmm(iso){if(!iso||iso.length<16)return null;return iso.slice(11,16)}
 function dur(m){if(!m)return null;return T('dur',{h:Math.floor(m/60),m:m%60})}
 
 $('go').onclick=function(){
- var o=$('o').value.trim().toUpperCase(),d=$('d').value.trim().toUpperCase();
- var codeOk=function(c){return c.length===2||c.length===3};
- if(!codeOk(o)||!codeOk(d)){setS(lang==='zh'?'請輸入 2-3 個字母嘅代碼(機場/城市/國家)':'Enter a 2-3 letter code (airport, city, or country)',true);return}
- var anyD=$('ad').checked;
+ var o=parseCode($('o').value),d=parseCode($('d').value);
+ if(!o||!d){setS(lang==='zh'?'請由下拉揀返個地方':'Pick a place from the dropdown',true);return}
+ var anyD=(dateMode!=='exact');
  if(!anyD&&!$('dd').value){setS('date',true);return}
  var p=new URLSearchParams();p.set('uid',UID);p.set('origin',o);p.set('destination',d);p.set('trip',trip);
- if(anyD){p.set('anyDate','1')}
+ if(anyD){p.set('anyDate','1');if(dateMode==='weekend')p.set('dateMode','weekend');if(dateMode==='month')p.set('dateMode','month')}
  else{p.set('departDate',$('dd').value);if(trip==='return'&&$('rd').value)p.set('returnDate',$('rd').value);
   if($('fx').checked)p.set('flexible','1')}
  p.set('currency',$('cu').value);p.set('pax',$('px').value);
@@ -1659,6 +1829,27 @@ function render(x){
    h+='<div class="vb">'+T('a_plan')+'</div>';
   }
   e.innerHTML=h;
+  var wbtn=document.createElement('button');wbtn.className='b vf';wbtn.style.marginTop='10px';wbtn.style.marginRight='6px';
+  wbtn.textContent='⭐ '+T('w_add');
+  wbtn.onclick=function(){
+   var tgt=A.estimate?A.estimate.low:(A.headline?Math.round(A.headline.price*0.9):null);
+   fetch('/api/watch?uid='+UID,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({origin:x.query.origin,destination:x.query.destination,target:tgt})})
+   .then(function(){wbtn.textContent='✓ '+T('w_added')});
+  };
+  e.appendChild(wbtn);
+  /* alternative destinations on the empty tiers — the assistant never stops helping */
+  if(A.alternatives&&A.alternatives.length){
+   var alt=document.createElement('div');alt.className='vs';alt.style.marginTop='9px';
+   var ah='<span style="color:var(--dim)">'+T('a_alts')+'</span> ';
+   A.alternatives.forEach(function(al){
+    ah+='<button class="b ota" style="margin:2px" data-dest="'+al.destination+'">'+al.destination+' '+M(al.price,x.query.currency)+'</button>'});
+   alt.innerHTML=ah;
+   alt.addEventListener('click',function(ev){
+    var dd2=ev.target.getAttribute('data-dest');
+    if(dd2){$('d').value=dd2;$('go').click()}});
+   e.appendChild(alt);
+  }
   if(A.channel&&A.channel.url){
    var cb=document.createElement('a');cb.className='b of';cb.style.marginTop='10px';cb.style.display='inline-block';
    cb.href=A.channel.url;cb.target='_blank';cb.rel='noopener';
