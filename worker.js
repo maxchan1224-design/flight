@@ -363,6 +363,91 @@ const json = (o,s=200)=>new Response(JSON.stringify(o),{status:s,
 
 function addDays(iso,n){ const d=new Date(iso+"T00:00:00Z"); d.setUTCDate(d.getUTCDate()+n); return d.toISOString().slice(0,10); }
 
+
+/* ================================================================
+ * THE ANSWER — the whole product in one object.
+ * Rule: this function never returns null. Whatever the research
+ * found, the user gets a conclusion, not homework.
+ * ================================================================ */
+
+function buildEstimate(routeFares, history) {
+  // Derived expected price for the requested route from ALL cached
+  // evidence (any date this year) + own recorded history. Labelled as
+  // an estimate; basis and sample counts are part of the object.
+  const prices = routeFares.map(o=>o.price).filter(p=>p!=null);
+  const hist = (history&&history.points?history.points:[]).map(p=>p.price).filter(p=>p!=null);
+  const all = prices.concat(hist);
+  if (!all.length) return null;
+  const sorted=[...all].sort((a,b)=>a-b);
+  const q = f => sorted[Math.min(sorted.length-1, Math.floor(sorted.length*f))];
+  return {
+    low: sorted[0],
+    typical: q(0.5),
+    high: q(0.8),
+    samples: all.length,
+    basis: { cachedFares: prices.length, historyDays: hist.length },
+  };
+}
+
+function buildAnswer(q, primary, onRouteOtherDates, altAirports, recommendation, context, estimate) {
+  const best = recommendation && recommendation.best;
+
+  if (best && (q.anyDate || (best.origin===q.origin && best.destination===q.destination))) {
+    const ch = (best.channels||[]).find(c=>c.kind==="book") || (best.channels||[])[0] || null;
+    return {
+      kind: primary.length && primary[0].via!=="other_date" ? "exact" : "adjusted",
+      headline: { origin:best.origin, destination:best.destination,
+        departDate:best.departDate, returnDate:best.returnDate,
+        price:best.price, currency:best.currency, airlineName:best.airlineName,
+        stops:best.stops, via:best.via },
+      channel: ch ? { id:ch.id, zh:ch.zh, en:ch.en, url:ch.url } : null,
+      timing: context
+        ? { verdict:context.verdict, percentile:context.percentile, samples:context.samples }
+        : { verdict:"no_history", samples:0 },
+      estimate,
+      note: primary.length && primary[0].via==="other_date" ? "dates_adjusted" : null,
+    };
+  }
+
+  // Tier 2: nothing on the exact route/dates, but a real alternative exists
+  const alt = (onRouteOtherDates[0] || altAirports[0]) || null;
+  if (alt) {
+    const ch = (alt.channels||[]).find(c=>c.kind==="book") || (alt.channels||[])[0] || null;
+    return {
+      kind: alt.origin!==q.origin||alt.destination!==q.destination ? "alternative_airport" : "alternative_date",
+      headline: { origin:alt.origin, destination:alt.destination,
+        departDate:alt.departDate, returnDate:alt.returnDate,
+        price:alt.price, currency:alt.currency, airlineName:alt.airlineName,
+        stops:alt.stops, via:alt.via },
+      channel: ch ? { id:ch.id, zh:ch.zh, en:ch.en, url:ch.url } : null,
+      timing: { verdict:"no_history", samples:0 },
+      estimate,
+      note: "request_had_no_cached_fares",
+    };
+  }
+
+  // Tier 3: estimate only — still an answer, with an expected price and a plan
+  if (estimate) {
+    return {
+      kind: "estimate_only",
+      headline: null,
+      channel: null,
+      timing: { verdict:"no_history", samples:0 },
+      estimate,
+      note: "no_bookable_cache_but_price_derivable",
+    };
+  }
+
+  // Tier 4: zero data anywhere — the answer is a concrete plan, not a shrug
+  return {
+    kind: "action_plan",
+    headline: null, channel: null,
+    timing: { verdict:"no_history", samples:0 },
+    estimate: null,
+    note: "route_has_no_cached_data_at_all",
+  };
+}
+
 async function handleSearch(request, env) {
   const t0 = Date.now();
   const p = new URL(request.url).searchParams;
@@ -435,8 +520,9 @@ async function handleSearch(request, env) {
     try { const r = await searchExact(env,q,nm); pool=pool.concat(r); mark("exact_dates",true,r.length); }
     catch(e){ mark("exact_dates",false,0,e.message); }
 
-    // --- 2. ±3 days around the requested date
-    if (q.flexible || pool.length < 4) {
+    // --- 2. ±3 days around the requested date — always runs: it is evidence
+    // for the estimate and the conclusion, not a fallback.
+    if (true) {
       const shifts = [-3,-2,-1,1,2,3];
       const got = await Promise.all(shifts.map(async s=>{
         try {
@@ -449,8 +535,8 @@ async function handleSearch(request, env) {
       const flat = got.flat(); pool = pool.concat(flat); mark("flex_dates",true,flat.length);
     }
 
-    // --- 3. month calendar
-    if (pool.length < 8) {
+    // --- 3. month calendar — always runs (feeds the price estimate)
+    if (true) {
       try { const r = await searchMonth(env,q,nm,q.departDate.slice(0,7)); pool=pool.concat(r); mark("month_calendar",true,r.length); }
       catch(e){ mark("month_calendar",false,0,e.message); }
     }
@@ -459,8 +545,8 @@ async function handleSearch(request, env) {
     try { const r = await searchNearby(env,q,nm); pool=pool.concat(r); mark("nearby_airports",true,r.filter(o=>o.via!=="requested").length); }
     catch(e){ mark("nearby_airports",false,0,e.message); }
 
-    // --- 5. last resort: anything cached on this route at all
-    if (!pool.length) {
+    // --- 5. anything cached on this route this year — always runs
+    if (true) {
       try { const r = await searchLatest(env,q,nm); pool=pool.concat(r); mark("recent_cache",true,r.length); }
       catch(e){ mark("recent_cache",false,0,e.message); }
     }
@@ -553,10 +639,14 @@ async function handleSearch(request, env) {
       verdict: (below/pr.length)<=0.2 ? "good_time" : ((below/pr.length)>=0.75 ? "consider_waiting" : "typical") };
   }
 
-  // search links so the user is never stranded
+  // The Answer — always present, built from all evidence gathered above.
+  const routeFares = offers.filter(o=>o.origin===q.origin && o.destination===q.destination);
+  const estimate = buildEstimate(routeFares, history);
+  const answer = buildAnswer(q, primary, onRouteOtherDates, altAirports, recommendation, context, estimate);
+
+  // verification links — a footnote for checking, never the product's output
   const fallbackLinks = [];
-  if (!primary.length) {
-    const a = null;
+  {
     fallbackLinks.push({ id:"google", en:"Search on Google Flights", zh:"去 Google Flights 搵",
       url:"https://www.google.com/travel/flights?q="+encodeURIComponent(
         "Flights from "+q.origin+" to "+q.destination+" on "+q.departDate+(q.returnDate?" through "+q.returnDate:"")) });
@@ -569,13 +659,14 @@ async function handleSearch(request, env) {
 
   return json({
     query:q, weights,
+    answer,
     results: primary.slice(0,25),
     resultsAreExactRoute: main.length>0,
     recommendation,
     savings: savings.slice(0,6),
     otherDates: onRouteOtherDates.slice(0,8),
     context,
-    fallbackLinks,
+    verifyLinks: fallbackLinks,
     trust: {
       sources,
       unavailable: [
@@ -651,8 +742,25 @@ async function handlePlaces(request) {
 
 async function handleExplain(request, env) {
   const b = await request.json().catch(()=>({}));
-  const { recommendation:rec, savings, context, lang } = b;
+  const { recommendation:rec, savings, context, lang, answer } = b;
   const zh = lang==="zh";
+
+  // Tiers 3/4: no bookable option — the narration IS the product here.
+  if (answer && (answer.kind==="estimate_only" || answer.kind==="action_plan")) {
+    let t;
+    if (answer.kind==="estimate_only" && answer.estimate) {
+      const e=answer.estimate;
+      t = zh
+        ? "你指定嗰日暫時冇快取票價 — 唔代表冇航班,只係最近冇人搜過。根據呢條線今年嘅 "+e.samples+" 個數據,合理價大約 "+e.typical+",低見 "+e.low+"。建議:照下面連結核實,見到接近 "+e.low+" 至 "+e.typical+" 就可以落手。"
+        : "No cached fares for your exact date — that does not mean no flights, only that nobody searched it recently. From "+e.samples+" data points on this route this year, a fair price is about "+e.typical+", as low as "+e.low+". Verify via the links below; anything near "+e.low+"–"+e.typical+" is worth taking.";
+    } else {
+      t = zh
+        ? "呢條線今年完全冇快取數據,連估價都做唔到 — 通常代表航班好少或者要轉機。建議:改用附近大機場再搜一次,或者用國家代碼(例如 JP)搵全國最平入口。"
+        : "This route has zero cached data this year — not even an estimate is derivable, which usually means very thin or indirect service. Suggest re-searching from a nearby major airport, or using the country code (e.g. JP) to find the cheapest gateway.";
+    }
+    return json({ text:t, source:"rules" });
+  }
+
   if (!rec || !rec.best) return json({ text:"", source:"none" });
 
   const bt=rec.best, ch=rec.cheapest;
@@ -682,11 +790,15 @@ async function handleExplain(request, env) {
       topSaving: savings&&savings[0] ? { origin:savings[0].offer.origin, saving:savings[0].saving,
         groundCost:savings[0].groundCost, netSaving:savings[0].netSaving, groundKnown:savings[0].groundKnown } : null,
       priceContext: context,
+      answerKind: answer ? answer.kind : null,
+      estimate: answer ? answer.estimate : null,
     };
     const prompt =
       "You are a flight booking advisor. Use ONLY the numbers in this JSON — never invent a price, " +
       "a flight number, or a departure time. Never predict a future sale. " +
       "If topSaving.groundKnown is false, note the traveller must add their own transport cost. " +
+      "If answerKind is 'adjusted' or 'alternative_date', state clearly the dates differ from the request. " +
+      "If estimate is present, you may cite its typical/low values as expected-price context, always calling it an estimate. " +
       (zh ? "用香港廣東話書面語,80 字以內,純文字,唔好用 markdown。"
           : "Reply in English, under 70 words, plain text, no markdown. ") +
       "Say which flight to book and why in one short paragraph. JSON: " + JSON.stringify(facts);
@@ -700,11 +812,235 @@ async function handleExplain(request, env) {
   } catch(e){ return json({ text:fb, source:"rules" }); }
 }
 
+
+/* ================================================================
+ * JOURNEY 1 — DEAL DISCOVERY (no destination, no input)
+ * "Today's best deals" from every legally accessible source:
+ * cached fares scanned year-wide + community promotion signals.
+ * Platforms without APIs are disclosed, with verification links.
+ * ================================================================ */
+
+const DEAL_WORDS=["error fare","mistake fare","flash sale","promo","promotion","sale","deal","discount","% off","fare drop"];
+
+async function communitySignals(env, origin) {
+  const key="signals:"+(origin||"any");
+  if (env.HISTORY){ const c=await env.HISTORY.get(key,"json"); if(c) return c; }
+  const subs=["TravelDeals","awardtravel","flights"];
+  const raw=[];
+  await Promise.all(subs.map(async sub=>{
+    try{
+      const r=await fetch("https://www.reddit.com/r/"+sub+"/new.json?limit=25",
+        {headers:{"User-Agent":"flight-deal-assistant/1.0 (personal)"}});
+      if(!r.ok)return;
+      const d=await r.json();
+      for(const c of (d.data&&d.data.children)||[])
+        raw.push({source:"r/"+sub,title:c.data.title,url:"https://reddit.com"+c.data.permalink,ts:c.data.created_utc*1000});
+    }catch(e){}
+  }));
+  const fp=t=>t.toLowerCase().replace(/[^a-z0-9 ]/g,"").replace(/\s+/g," ").trim().slice(0,70);
+  const seen=new Map();
+  for(const x of raw){
+    const t=x.title.toLowerCase(); let score=0;
+    for(const w of DEAL_WORDS) if(t.includes(w)) score+=2;
+    if(t.includes("error fare")||t.includes("mistake fare")) score+=5;
+    if(origin&&t.includes(origin.toLowerCase())) score+=4;
+    if(score<4) continue;
+    const k=fp(x.title); const prev=seen.get(k);
+    if(!prev) seen.set(k,{...x,score,alsoSeenIn:[]});
+    else if(prev.source!==x.source&&!prev.alsoSeenIn.includes(x.source)){prev.alsoSeenIn.push(x.source);prev.score+=1;}
+  }
+  const out=[...seen.values()].sort((a,b)=>b.score-a.score||b.ts-a.ts).slice(0,10);
+  if(env.HISTORY) await env.HISTORY.put(key,JSON.stringify(out),{expirationTtl:10800});
+  return out;
+}
+
+async function handleFeed(request, env) {
+  const p=new URL(request.url).searchParams;
+  const origin=(p.get("origin")||"HKG").toUpperCase().trim();
+  const currency=(p.get("currency")||"HKD").toUpperCase();
+  if(!env.TRAVELPAYOUTS_TOKEN) return json({error:"TRAVELPAYOUTS_TOKEN not configured"},500);
+
+  const cacheKey="feed:"+origin+":"+currency;
+  if(env.HISTORY){const c=await env.HISTORY.get(cacheKey,"json"); if(c) return json({...c,cached:true});}
+
+  const nm=await names(env);
+  let fares=[], fareErr=null;
+  try{
+    const b=await tp(env,"/v2/prices/latest",{
+      origin, currency:currency.toLowerCase(), period_type:"year",
+      one_way:"false", page:1, limit:100, sorting:"price",
+      show_to_affiliates:"true", market:env.DEFAULT_MARKET||"hk"});
+    fares=(b.data||[]).map(d=>makeOffer({
+      origin:d.origin||origin, destination:d.destination,
+      departDate:d.depart_date, returnDate:d.return_date||null,
+      price:d.value, currency, stops:d.number_of_changes,
+      airlineCode:d.gate||null, airlineName:nm[d.gate]||d.gate||null,
+      via:"any_date", foundVia:"deal_scan"}));
+  }catch(e){ fareErr=e.message; }
+
+  // cheapest per destination, then deal-score against recorded history when we have it
+  const byDest=new Map();
+  for(const o of fares){
+    if(o.price==null||!o.destination) continue;
+    const cur=byDest.get(o.destination);
+    if(!cur||o.price<cur.price) byDest.set(o.destination,o);
+  }
+  const deals=[];
+  for(const o of byDest.values()){
+    let score=null;
+    if(env.HISTORY){
+      const h=await env.HISTORY.get("hist:"+origin+"-"+o.destination,"json");
+      const pts=(h&&h.points?h.points:[]).map(x=>x.price).filter(x=>x!=null);
+      if(pts.length>=10){
+        const below=pts.filter(x=>x<o.price).length;
+        const pct=Math.round(below/pts.length*100);
+        score={percentile:pct,samples:pts.length,
+          tier:pct<=15?"hot":(pct<=35?"good":(pct>=75?"high":"typical"))};
+      }
+    }
+    deals.push({...o,dealScore:score,channels:channelsFor(o,env.TP_MARKER,1)});
+  }
+  deals.sort((a,b)=>a.price-b.price);
+
+  // Alternative-origin scan: same year-wide sweep from nearby departure
+  // cities, compared per destination. This is what powers cards like
+  // "Guangzhou departures saving HK$800+" — a computed fact, not a slogan.
+  const ALT_ORIGINS = origin==="HKG" ? ["CAN","SZX"] : [];
+  const altDeals=[];
+  for (const ao of ALT_ORIGINS){
+    try{
+      const ab=await tp(env,"/v2/prices/latest",{
+        origin:ao, currency:currency.toLowerCase(), period_type:"year",
+        one_way:"false", page:1, limit:60, sorting:"price",
+        show_to_affiliates:"true", market:env.DEFAULT_MARKET||"hk"});
+      const altBy=new Map();
+      for(const d of (ab.data||[])){
+        if(d.value==null||!d.destination) continue;
+        const cur=altBy.get(d.destination);
+        if(!cur||d.value<cur.value) altBy.set(d.destination,d);
+      }
+      for(const [dest,d] of altBy){
+        const home=byDest.get(dest);
+        if(!home) continue;
+        const saving=home.price-d.value;
+        if(saving>=250){
+          altDeals.push({...makeOffer({
+            origin:ao,destination:dest,departDate:d.depart_date,
+            returnDate:d.return_date||null,price:d.value,currency,
+            stops:d.number_of_changes,airlineCode:d.gate||null,
+            airlineName:nm[d.gate]||d.gate||null,via:"other_origin",foundVia:"alt_origin_scan"}),
+            homePrice:home.price, saving,
+            channels:channelsFor({origin:ao,destination:dest,departDate:d.depart_date,
+              returnDate:d.return_date||null,airlineCode:d.gate||null},env.TP_MARKER,1)});
+        }
+      }
+    }catch(e){}
+  }
+  altDeals.sort((a,b)=>b.saving-a.saving);
+
+  const signals=await communitySignals(env,origin);
+  const top=deals[0]||null;
+  const payload={
+    origin,currency,
+    verdict: top?{destination:top.destination,price:top.price,currency,departDate:top.departDate,returnDate:top.returnDate,airlineName:top.airlineName}:null,
+    deals:deals.slice(0,20),
+    altDeals:altDeals.slice(0,6),
+    signals,
+    fareError:fareErr,
+    disclosure:"integrated_legal_sources_only",
+    refreshedAt:new Date().toISOString(),
+  };
+  if(env.HISTORY) await env.HISTORY.put(cacheKey,JSON.stringify(payload),{expirationTtl:3600*3});
+  return json(payload);
+}
+
+/* ================================================================
+ * JOURNEY 3 — TRAVEL INSPIRATION (budget + weekend, no destination)
+ * "HK$2,000, Friday evening out, back Sunday or Monday — where?"
+ * ================================================================ */
+
+// HK public holidays 2026 — static reference list; verify near travel.
+const HK_HOLIDAYS_2026=["2026-01-01","2026-02-17","2026-02-18","2026-02-19",
+"2026-04-03","2026-04-04","2026-04-06","2026-05-01","2026-05-25","2026-06-19",
+"2026-07-01","2026-09-26","2026-10-01","2026-10-19","2026-12-25","2026-12-26"];
+
+function weekday(iso){ return new Date(iso+"T00:00:00Z").getUTCDay(); } // 0=Sun..6=Sat
+function tripDays(a,b){ return Math.round((new Date(b)-new Date(a))/86400000); }
+function nearHoliday(iso){
+  for(const h of HK_HOLIDAYS_2026){
+    const d=Math.abs(Math.round((new Date(iso)-new Date(h))/86400000));
+    if(d<=1) return h;
+  }
+  return null;
+}
+
+async function handleInspire(request, env) {
+  const p=new URL(request.url).searchParams;
+  const origin=(p.get("origin")||"HKG").toUpperCase().trim();
+  const currency=(p.get("currency")||"HKD").toUpperCase();
+  const budget=Math.max(0,parseInt(p.get("budget")||"2000",10));
+  const weekendOnly=p.get("weekend")!=="0";
+  if(!env.TRAVELPAYOUTS_TOKEN) return json({error:"TRAVELPAYOUTS_TOKEN not configured"},500);
+
+  const nm=await names(env);
+  let fares=[];
+  try{
+    const b=await tp(env,"/v2/prices/latest",{
+      origin, currency:currency.toLowerCase(), period_type:"year",
+      one_way:"false", page:1, limit:300, sorting:"price",
+      show_to_affiliates:"true", market:env.DEFAULT_MARKET||"hk"});
+    fares=(b.data||[]).map(d=>makeOffer({
+      origin:d.origin||origin, destination:d.destination,
+      departDate:d.depart_date, returnDate:d.return_date||null,
+      price:d.value, currency, stops:d.number_of_changes,
+      airlineCode:d.gate||null, airlineName:nm[d.gate]||d.gate||null,
+      via:"any_date", foundVia:"inspiration_scan"}));
+  }catch(e){ return json({error:e.message},502); }
+
+  const withinBudget=fares.filter(o=>o.price!=null&&o.price<=budget&&o.departDate&&o.returnDate);
+  const overBudgetCount=fares.filter(o=>o.price!=null&&o.price>budget).length;
+
+  const annotated=withinBudget.map(o=>{
+    const dw=weekday(o.departDate), rw=weekday(o.returnDate);
+    const days=tripDays(o.departDate,o.returnDate);
+    const weekendFit=(dw===5||dw===6)&&(rw===0||rw===1)&&days>=2&&days<=4;
+    const hol=nearHoliday(o.departDate)||nearHoliday(o.returnDate);
+    return {...o,weekendFit,holiday:hol,days};
+  });
+
+  const pool=weekendOnly?annotated.filter(o=>o.weekendFit||o.holiday):annotated;
+  const excludedByWeekend=annotated.length-pool.length;
+
+  // best per destination
+  const byDest=new Map();
+  for(const o of pool){
+    const cur=byDest.get(o.destination);
+    if(!cur||o.price<cur.price) byDest.set(o.destination,o);
+  }
+  const ideas=[...byDest.values()]
+    .map(o=>({...o,channels:channelsFor(o,env.TP_MARKER,1)}))
+    .sort((a,b)=>a.price-b.price);
+
+  const top=ideas[0]||null;
+  return json({
+    origin,currency,budget,weekendOnly,
+    verdict: top?{destination:top.destination,price:top.price,departDate:top.departDate,
+      returnDate:top.returnDate,days:top.days,weekendFit:top.weekendFit,holiday:top.holiday,
+      airlineName:top.airlineName,budgetLeft:budget-top.price}:null,
+    ideas:ideas.slice(0,15),
+    stats:{scanned:fares.length,withinBudget:withinBudget.length,
+      overBudget:overBudgetCount,excludedByWeekendFilter:excludedByWeekend},
+    holidaysNote:"hk_holidays_2026_static_reference_verify_before_travel",
+  });
+}
+
 export default {
   async fetch(request, env) {
     const p = new URL(request.url).pathname;
     try {
       if (p==="/api/search") return await handleSearch(request, env);
+      if (p==="/api/feed") return await handleFeed(request, env);
+      if (p==="/api/inspire") return await handleInspire(request, env);
       if (p==="/api/prefs") return await handlePrefs(request, env);
       if (p==="/api/ground") return await handleGround(request, env);
       if (p==="/api/places") return await handlePlaces(request);
@@ -746,6 +1082,16 @@ header{display:flex;align-items:center;justify-content:space-between;padding:4px
 .lang{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
 .lang button{background:none;border:none;color:var(--dim);padding:5px 10px;font-size:.76rem;cursor:pointer;font-family:var(--f)}
 .lang button.on{background:var(--card2);color:var(--tx);font-weight:600}
+.jt{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-bottom:14px}
+.jt button{background:var(--card);border:1px solid var(--line);color:var(--dim);border-radius:11px;padding:12px 4px;font-size:.8rem;cursor:pointer;font-family:var(--f);display:flex;flex-direction:column;align-items:center;gap:3px}
+.jt button.on{border-color:var(--acc);color:var(--acc);background:var(--card2);font-weight:600}
+.jt .ji{font-size:1.15rem}
+.vd{background:linear-gradient(180deg,#12261a,#161b22);border:1px solid var(--acc);border-radius:12px;padding:15px;margin-bottom:12px}
+.vd .vl{font-size:.62rem;color:var(--acc);letter-spacing:.14em;text-transform:uppercase;font-weight:700;margin-bottom:7px}
+.vd .vb{font-size:1.05rem;font-weight:700;line-height:1.5}
+.vd .vs{font-size:.78rem;color:var(--dim);margin-top:5px}
+.hb{font-size:.63rem;border-radius:4px;padding:2px 7px;font-weight:600;background:#33240f;color:#f0a742}
+.wb{font-size:.63rem;border-radius:4px;padding:2px 7px;font-weight:600;background:#0f2a33;color:#58a6ff}
 /* search */
 .sb{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:12px}
 .tt{display:flex;gap:6px;margin-bottom:9px}
@@ -842,6 +1188,24 @@ details.tr[open] summary:before{content:'▾ '}
 <header><div class="logo">Flight<span>Deal</span></div>
 <div class="lang"><button id="lz" class="on">繁中</button><button id="le">EN</button></div></header>
 
+<div class="jt">
+  <button class="on" data-j="j1"><span class="ji">🔥</span><span data-i="j1">今日筍盤</span></button>
+  <button data-j="j2"><span class="ji">🎯</span><span data-i="j2">目的地研究</span></button>
+  <button data-j="j3"><span class="ji">🎲</span><span data-i="j3">去邊好</span></button>
+</div>
+
+<!-- ============ JOURNEY 1: DEAL DISCOVERY — zero input ============ -->
+<section id="j1">
+  <div class="rw c2" style="margin-bottom:8px">
+    <div><label data-i="f_origin">出發地</label><input id="f-o" value="HKG" maxlength="3"></div>
+    <div><label data-i="cur">貨幣</label><select id="f-cu"><option>HKD</option><option>TWD</option><option>USD</option><option>JPY</option><option>SGD</option></select></div>
+  </div>
+  <div class="st" id="f-st"></div>
+  <div id="f-out"></div>
+</section>
+
+<!-- ============ JOURNEY 2: DESTINATION SEARCH ============ -->
+<section id="j2" class="hidden">
 <div class="sb">
   <div class="tt"><button class="on" data-t="return" data-i="ret">來回</button><button data-t="oneway" data-i="one">單程</button></div>
   <div class="rw c2">
@@ -864,6 +1228,24 @@ details.tr[open] summary:before{content:'▾ '}
 </div>
 <div class="st" id="st"></div>
 <div id="out"></div>
+</section>
+
+<!-- ============ JOURNEY 3: TRAVEL INSPIRATION ============ -->
+<section id="j3" class="hidden">
+  <div class="sb">
+    <div class="rw c2">
+      <div><label data-i="f_origin">出發地</label><input id="i-o" value="HKG" maxlength="3"></div>
+      <div><label data-i="i_budget">預算(來回機票)</label><input id="i-b" type="number" value="2000" min="100" step="100"></div>
+    </div>
+    <div class="rw c2">
+      <div><label data-i="cur">貨幣</label><select id="i-cu"><option>HKD</option><option>TWD</option><option>USD</option><option>JPY</option><option>SGD</option></select></div>
+      <div style="display:flex;align-items:flex-end;padding-bottom:2px"><label style="display:flex;align-items:center;gap:7px;margin:0;font-size:.8rem;cursor:pointer"><input type="checkbox" id="i-w" checked style="width:auto"> <span data-i="i_weekend">淨係睇週末 / 假期</span></label></div>
+    </div>
+    <button class="go" id="i-go" data-i="i_go">話我知去邊好</button>
+  </div>
+  <div class="st" id="i-st"></div>
+  <div id="i-out"></div>
+</section>
 
 <details class="set" id="setbox"><summary style="cursor:pointer;font-size:.8rem;color:var(--dim);list-style:none" data-i="settings">⚙︎ 我嘅取向</summary>
 <div style="padding-top:10px">
@@ -890,6 +1272,24 @@ details.tr[open] summary:before{content:'▾ '}
 var $=function(i){return document.getElementById(i)};
 var UID=(function(){try{var k=localStorage.getItem('fd_uid');if(!k){k='u'+Math.random().toString(36).slice(2,9);localStorage.setItem('fd_uid',k)}return k}catch(e){return'anon'}})();
 var L={zh:{
+ j1:'今日筍盤',j2:'目的地研究',j3:'去邊好',
+ f_origin:'出發地',i_budget:'預算(來回機票)',i_weekend:'淨係睇週末 / 假期',i_go:'話我知去邊好',
+ f_loading:'搵緊今日最抵…',f_verdict:'🔥 今日必知',f_deals:'🌏 邊度最平',f_signals:'🎉 社群報料',
+ f_drops:'📉 平過平時',f_direct:'✈ 直航筍盤',f_alt:'🚄 隔籬機場出發更平',f_alt_line:'由 {o} 出發平 {s}(HKG 價 {h})',f_from:'低至',
+ f_sig_note:'以下係社群報料,唔係預測。冇 API 嘅平台(Google Flights / Trip.com 等)無法直接讀取,只能提供連結俾你自己核實。',
+ f_none:'暫時未搵到快取平價。',
+ i_verdict:'建議',i_ideas:'預算內嘅選擇',i_none:'預算內搵唔到合適嘅週末航班。試下加大預算,或者取消「淨係睇週末」。',
+ i_line:'{d} · {p} · 仲剩 {left} 使',i_days:'{n} 日',
+ i_stats:'掃描咗 {s} 條航線 · {w} 個喺預算內 · {e} 個唔啱週末被剔走',
+ hol:'假期',wknd:'週末',
+ a_title:'結論',a_go:'去邊最抵',a_buy:'點買最抵',a_when:'應唔應該買',
+ a_exact:'照你指定日期',a_adjusted:'⚠️ 日期同你指定嘅唔同',a_altair:'⚠️ 建議改用另一個機場',
+ a_est_line:'預計合理價 {t}(低見 {lo},根據 {n} 個數據)',
+ a_est_only:'你指定嗰日冇快取價 — 唔等於冇航班。',
+ a_plan:'呢條線今年冇任何快取數據。建議改用附近大機場,或者用國家代碼(如 JP)搵全國最平入口。',
+ a_now:'✅ 而家買 — 喺你紀錄嘅第 {p} 百分位',a_wait:'⏳ 可以等 — 高過平時',a_nohist:'📊 未有足夠歷史,用估價做參考',
+ a_verify:'落單前核實:',
+ vd_go:'去研究呢條線 →',
  ret:'來回',one:'單程',from:'出發',to:'目的地',dep:'去程',retd:'回程',cur:'貨幣',pax:'人數',
  rad:'附近機場',off:'唔使',flex:'前後 3 日都睇埋',bag:'要寄艙行李',anyd:'唔限日期 · 搵全年最平',search:'搵機票',settings:'⚙︎ 我嘅取向',
  place_country:'國家',place_city:'城市',place_airport:'機場',any_date:'搵到嘅日期',
@@ -914,6 +1314,24 @@ var L={zh:{
  t_counts:'合共 {n} 個結果 · {ms}ms',
  yes:'肯',no:'唔肯'
 },en:{
+ j1:"Today's deals",j2:'Research a trip',j3:'Where to go',
+ f_origin:'From',i_budget:'Budget (round trip)',i_weekend:'Weekends / holidays only',i_go:'Tell me where to go',
+ f_loading:'Finding today\u2019s best…',f_verdict:'🔥 Know today',f_deals:'🌏 Cheapest anywhere',f_signals:'🎉 Community signals',
+ f_drops:'📉 Unusually cheap',f_direct:'✈ Direct-flight deals',f_alt:'🚄 Cheaper from a nearby airport',f_alt_line:'From {o}: {s} cheaper (HKG price {h})',f_from:'from',
+ f_sig_note:'These are community reports, not forecasts. Platforms without APIs (Google Flights, Trip.com, etc.) cannot be read directly — links are provided so you can verify yourself.',
+ f_none:'No cached deals found right now.',
+ i_verdict:'Suggestion',i_ideas:'Options within budget',i_none:'Nothing fits this budget on a weekend. Raise the budget or untick weekends-only.',
+ i_line:'{d} · {p} · {left} left over',i_days:'{n} days',
+ i_stats:'Scanned {s} routes · {w} within budget · {e} filtered out by weekend rule',
+ hol:'Holiday',wknd:'Weekend',
+ a_title:'The answer',a_go:'Best option',a_buy:'How to book',a_when:'Buy now?',
+ a_exact:'On your requested dates',a_adjusted:'⚠️ Dates differ from your request',a_altair:'⚠️ Different airport suggested',
+ a_est_line:'Fair price about {t} (as low as {lo}, from {n} data points)',
+ a_est_only:'No cached fare for your exact date — that does not mean no flights.',
+ a_plan:'Zero cached data on this route this year. Try a nearby major airport, or a country code (e.g. JP) to find the cheapest gateway.',
+ a_now:'✅ Buy now — {p}th percentile of your history',a_wait:'⏳ Can wait — above the usual range',a_nohist:'📊 Not enough history; using the estimate as reference',
+ a_verify:'Verify before paying:',
+ vd_go:'Research this route →',
  ret:'Round trip',one:'One way',from:'From',to:'To',dep:'Depart',retd:'Return',cur:'Currency',pax:'Travellers',
  rad:'Nearby airports',off:'Off',flex:'Include ±3 days',bag:'Need checked bag',anyd:'Any date · find cheapest all year',search:'Find flights',settings:'⚙︎ My preferences',
  place_country:'Country',place_city:'City',place_airport:'Airport',any_date:'Found date',
@@ -944,6 +1362,171 @@ function ap(){document.documentElement.lang=lang==='zh'?'zh-Hant':'en';
  var e=document.querySelectorAll('[data-i]');for(var i=0;i<e.length;i++){var k=e[i].getAttribute('data-i');if(L[lang][k])e[i].textContent=L[lang][k]}
  $('lz').className=lang==='zh'?'on':'';$('le').className=lang==='en'?'on':'';qz();if(last)render(last)}
 $('lz').onclick=function(){lang='zh';ap()};$('le').onclick=function(){lang='en';ap()};
+/* ---- journey switching ---- */
+var jb=document.querySelectorAll('.jt button');
+var curJ='j1';
+for(var i=0;i<jb.length;i++)jb[i].onclick=function(){
+ for(var j=0;j<jb.length;j++)jb[j].className='';this.className='on';
+ curJ=this.getAttribute('data-j');
+ $('j1').className=curJ==='j1'?'':'hidden';
+ $('j2').className=curJ==='j2'?'':'hidden';
+ $('j3').className=curJ==='j3'?'':'hidden';
+ if(curJ==='j1'&&!feedLoaded)loadFeed();
+};
+
+/* ---- JOURNEY 1: deal feed, loads itself ---- */
+var feedLoaded=false;
+function loadFeed(){
+ $('f-st').textContent=T('f_loading');$('f-out').innerHTML='';
+ var o=($('f-o').value||'HKG').trim().toUpperCase();
+ fetch('/api/feed?origin='+o+'&currency='+$('f-cu').value)
+ .then(function(r){return r.json()}).then(function(d){
+  feedLoaded=true;$('f-st').textContent='';
+  renderFeed(d);
+ }).catch(function(e){$('f-st').textContent=e.message;$('f-st').className='st e'});
+}
+$('f-o').addEventListener('change',function(){feedLoaded=false;loadFeed()});
+$('f-cu').addEventListener('change',function(){feedLoaded=false;loadFeed()});
+
+function dealCard(o,d,emphasize){
+ var e=document.createElement('div');e.className='f'+(emphasize?' top':'');
+ var badge='';
+ if(o.dealScore){
+  var t=o.dealScore.tier;
+  if(t==='hot')badge='<span class="bg cheap">🔥 P'+o.dealScore.percentile+'</span>';
+  else if(t==='good')badge='<span class="bg direct">⭐ P'+o.dealScore.percentile+'</span>';
+ }
+ var cmp=(o.channels||[]).filter(function(c){return c.kind!=='book'});
+ var links='';cmp.forEach(function(c){links+='<a class="b vf" href="'+c.url+'" target="_blank" rel="noopener">'+(lang==='zh'?c.zh:c.en)+'</a>'});
+ e.innerHTML='<div class="fh"><div><div class="al">'+o.origin+' → '+o.destination+'</div>'+
+  '<div class="fn">'+o.departDate+' → '+(o.returnDate||'')+' · '+(o.airlineName||'')+'</div></div>'+
+  '<div class="pr"><div class="v"><span style="font-size:.66rem;color:var(--dim);font-weight:400">'+T('f_from')+'</span> '+M(o.price,d.currency)+'</div></div></div>'+
+  '<div class="badges">'+(o.stops===0?'<span class="bg direct">'+T('direct')+'</span>':'')+badge+'</div>'+
+  '<div class="bw">'+links+'</div>';
+ /* tap anywhere on the card → research this route in Journey 2 */
+ e.style.cursor='pointer';
+ e.addEventListener('click',function(ev){
+  if(ev.target.tagName==='A')return;
+  $('o').value=o.origin;$('d').value=o.destination;
+  document.querySelectorAll('.jt button')[1].click();
+ });
+ return e;
+}
+function renderFeed(d){
+ var b=$('f-out');b.innerHTML='';
+ function H(k){var e=document.createElement('div');e.className='h';e.textContent=T(k);b.appendChild(e)}
+ if(d.verdict){
+  var v=document.createElement('div');v.className='vd';
+  v.innerHTML='<div class="vl">'+T('f_verdict')+'</div>'+
+   '<div class="vb">'+d.origin+' → '+d.verdict.destination+' · '+M(d.verdict.price,d.currency)+'</div>'+
+   '<div class="vs">'+d.verdict.departDate+' → '+(d.verdict.returnDate||'')+' · '+(d.verdict.airlineName||'')+'</div>';
+  var go=document.createElement('button');go.className='go';go.style.marginTop='10px';go.textContent=T('vd_go');
+  go.onclick=(function(dest){return function(){
+   $('d').value=dest;$('o').value=d.origin;
+   jb[1].click();
+  }})(d.verdict.destination);
+  v.appendChild(go);b.appendChild(v);
+ }
+ /* 📉 unusually cheap — deal-scored against own recorded history */
+ var drops=(d.deals||[]).filter(function(o){return o.dealScore&&(o.dealScore.tier==='hot'||o.dealScore.tier==='good')});
+ if(drops.length){
+  H('f_drops');
+  drops.forEach(function(o){b.appendChild(dealCard(o,d,true))});
+ }
+ /* 🚄 cheaper from a nearby airport — computed vs the home-airport fare */
+ if(d.altDeals&&d.altDeals.length){
+  H('f_alt');
+  d.altDeals.forEach(function(o){
+   var e=dealCard(o,d,false);
+   var line=document.createElement('div');
+   line.className='fn';line.style.cssText='color:var(--acc);margin-top:6px;font-weight:600';
+   line.textContent=T('f_alt_line',{o:o.origin,s:M(o.saving,d.currency),h:M(o.homePrice,d.currency)});
+   e.insertBefore(line,e.querySelector('.badges'));
+   b.appendChild(e)});
+ }
+ /* ✈ direct-flight deals */
+ var directs=(d.deals||[]).filter(function(o){return o.stops===0&&drops.indexOf(o)<0}).slice(0,6);
+ if(directs.length){
+  H('f_direct');
+  directs.forEach(function(o){b.appendChild(dealCard(o,d,false))});
+ }
+ /* 🌏 everything else, cheapest per destination */
+ var rest=(d.deals||[]).filter(function(o){return drops.indexOf(o)<0&&directs.indexOf(o)<0});
+ if(rest.length){
+  H('f_deals');
+  rest.forEach(function(o){
+   b.appendChild(dealCard(o,d,false))});
+ }
+ if(!(d.deals&&d.deals.length)){
+  var em=document.createElement('div');em.className='empty';em.textContent=T('f_none');b.appendChild(em);
+ }
+ if(d.signals&&d.signals.length){
+  H('f_signals');
+  var n=document.createElement('div');n.className='note';n.textContent=T('f_sig_note');b.appendChild(n);
+  d.signals.forEach(function(sg){
+   var e=document.createElement('div');e.className='f';
+   e.innerHTML='<a href="'+sg.url+'" target="_blank" rel="noopener" style="color:var(--tx);text-decoration:none;font-size:.86rem;line-height:1.45;display:block">'+String(sg.title).replace(/</g,'&lt;')+'</a>'+
+    '<div class="fn" style="margin-top:5px">'+sg.source+(sg.alsoSeenIn&&sg.alsoSeenIn.length?' · +'+sg.alsoSeenIn.length:'')+'</div>';
+   b.appendChild(e)});
+ }
+}
+
+/* ---- JOURNEY 3: inspiration ---- */
+$('i-go').onclick=function(){
+ var o=($('i-o').value||'HKG').trim().toUpperCase();
+ var budget=parseInt($('i-b').value||'2000',10);
+ $('i-st').textContent=T('searching');$('i-st').className='st';$('i-out').innerHTML='';
+ fetch('/api/inspire?origin='+o+'&currency='+$('i-cu').value+'&budget='+budget+'&weekend='+($('i-w').checked?'1':'0'))
+ .then(function(r){return r.json()}).then(function(d){
+  $('i-st').textContent='';
+  if(d.error){$('i-st').textContent=d.error;$('i-st').className='st e';return}
+  renderInspire(d);
+ }).catch(function(e){$('i-st').textContent=e.message;$('i-st').className='st e'});
+};
+
+function renderInspire(d){
+ var b=$('i-out');b.innerHTML='';
+ function H(k){var e=document.createElement('div');e.className='h';e.textContent=T(k);b.appendChild(e)}
+ if(!d.ideas||!d.ideas.length){
+  var em=document.createElement('div');em.className='empty';em.textContent=T('i_none');b.appendChild(em);
+  var st=document.createElement('div');st.className='note';
+  st.textContent=T('i_stats',{s:d.stats.scanned,w:d.stats.withinBudget,e:d.stats.excludedByWeekendFilter});
+  b.appendChild(st);return}
+ var v=d.verdict;
+ if(v){
+  var e=document.createElement('div');e.className='vd';
+  var tags='';
+  if(v.weekendFit)tags+=' <span class="wb">'+T('wknd')+'</span>';
+  if(v.holiday)tags+=' <span class="hb">'+T('hol')+' '+v.holiday+'</span>';
+  e.innerHTML='<div class="vl">'+T('i_verdict')+'</div>'+
+   '<div class="vb">'+d.origin+' → '+v.destination+tags+'</div>'+
+   '<div class="vs">'+T('i_line',{d:v.departDate+' → '+v.returnDate+' ('+T('i_days',{n:v.days})+')',p:M(v.price,d.currency),left:M(v.budgetLeft,d.currency)})+'</div>';
+  var go=document.createElement('button');go.className='go';go.style.marginTop='10px';go.textContent=T('vd_go');
+  go.onclick=(function(dest,dd,rd){return function(){
+   $('d').value=dest;$('o').value=d.origin;$('dd').value=dd;$('rd').value=rd;
+   document.querySelectorAll('.jt button')[1].click();
+  }})(v.destination,v.departDate,v.returnDate);
+  e.appendChild(go);b.appendChild(e);
+ }
+ H('i_ideas');
+ d.ideas.forEach(function(o){
+  var e=document.createElement('div');e.className='f';
+  var tags='';
+  if(o.weekendFit)tags+='<span class="wb">'+T('wknd')+'</span> ';
+  if(o.holiday)tags+='<span class="hb">'+T('hol')+'</span> ';
+  var cmp=(o.channels||[]).filter(function(c){return c.kind!=='book'});
+  var links='';cmp.forEach(function(c){links+='<a class="b vf" href="'+c.url+'" target="_blank" rel="noopener">'+(lang==='zh'?c.zh:c.en)+'</a>'});
+  e.innerHTML='<div class="fh"><div><div class="al">'+o.destination+'</div>'+
+   '<div class="fn">'+o.departDate+' → '+o.returnDate+' · '+T('i_days',{n:o.days})+' · '+(o.airlineName||'')+'</div></div>'+
+   '<div class="pr"><div class="v">'+M(o.price,d.currency)+'</div></div></div>'+
+   '<div class="badges">'+tags+(o.stops===0?'<span class="bg direct">'+T('direct')+'</span>':'')+'</div>'+
+   '<div class="bw">'+links+'</div>';
+  b.appendChild(e)});
+ var st=document.createElement('div');st.className='note';
+ st.textContent=T('i_stats',{s:d.stats.scanned,w:d.stats.withinBudget,e:d.stats.excludedByWeekendFilter});
+ b.appendChild(st);
+}
+
 var tb=document.querySelectorAll('.tt button');
 for(var i=0;i<tb.length;i++)tb[i].onclick=function(){for(var j=0;j<tb.length;j++)tb[j].className='';this.className='on';
  trip=this.getAttribute('data-t');$('rw').style.display=trip==='return'?'block':'none'};
@@ -1052,11 +1635,46 @@ function render(x){
  var cur=x.query.currency;
  function H(k){var e=document.createElement('div');e.className='h';e.textContent=T(k);b.appendChild(e)}
 
- if(!x.results||!x.results.length){
-  var em=document.createElement('div');em.className='empty';
-  em.innerHTML=T('no_res')+'<div class="fbw">'+(x.fallbackLinks||[]).map(function(l){
-   return '<a class="b ota" href="'+l.url+'" target="_blank" rel="noopener">'+(lang==='zh'?l.zh:l.en)+'</a>'}).join('')+'</div>';
-  b.appendChild(em);trust(x,b);return}
+ /* THE ANSWER — always rendered first, whatever the data situation */
+ if(x.answer){
+  var A=x.answer,e=document.createElement('div');e.className='vd';
+  var h='<div class="vl">'+T('a_title')+'</div>';
+  if(A.headline){
+   var hd=A.headline;
+   var situ=A.kind==='exact'?'<span class="bg direct">'+T('a_exact')+'</span>'
+    :(A.kind==='alternative_airport'?'<span class="bg stop">'+T('a_altair')+'</span>'
+    :'<span class="bg stop">'+T('a_adjusted')+'</span>');
+   h+='<div class="vb">'+T('a_go')+':'+hd.origin+' → '+hd.destination+' · '+M(hd.price,hd.currency)+'</div>'+
+    '<div class="vs">'+hd.departDate+(hd.returnDate?(' → '+hd.returnDate):'')+' · '+(hd.airlineName||'')+' · '+situ+'</div>';
+   if(A.channel)h+='<div class="vs" style="margin-top:7px"><b>'+T('a_buy')+':</b> '+(lang==='zh'?A.channel.zh:A.channel.en)+'</div>';
+   var tm=A.timing||{};
+   var tline=tm.verdict==='good_time'?T('a_now',{p:tm.percentile})
+    :(tm.verdict==='consider_waiting'?T('a_wait'):T('a_nohist'));
+   h+='<div class="vs"><b>'+T('a_when')+':</b> '+tline+'</div>';
+   if(A.estimate)h+='<div class="vs" style="color:var(--dim)">'+T('a_est_line',{t:M(A.estimate.typical,x.query.currency),lo:M(A.estimate.low,x.query.currency),n:A.estimate.samples})+'</div>';
+  }else if(A.kind==='estimate_only'&&A.estimate){
+   h+='<div class="vb">'+T('a_est_only')+'</div>'+
+    '<div class="vs">'+T('a_est_line',{t:M(A.estimate.typical,x.query.currency),lo:M(A.estimate.low,x.query.currency),n:A.estimate.samples})+'</div>';
+  }else{
+   h+='<div class="vb">'+T('a_plan')+'</div>';
+  }
+  e.innerHTML=h;
+  if(A.channel&&A.channel.url){
+   var cb=document.createElement('a');cb.className='b of';cb.style.marginTop='10px';cb.style.display='inline-block';
+   cb.href=A.channel.url;cb.target='_blank';cb.rel='noopener';
+   cb.textContent=(lang==='zh'?A.channel.zh:A.channel.en);
+   e.appendChild(cb);
+  }
+  if(x.verifyLinks&&x.verifyLinks.length){
+   var vf=document.createElement('div');vf.className='vs';vf.style.marginTop='9px';
+   var vh='<span style="color:var(--dim)">'+T('a_verify')+'</span> ';
+   x.verifyLinks.forEach(function(l){vh+='<a class="b vf" style="margin:2px" href="'+l.url+'" target="_blank" rel="noopener">'+(lang==='zh'?l.zh:l.en)+'</a>'});
+   vf.innerHTML=vh;e.appendChild(vf);
+  }
+  b.appendChild(e);
+ }
+
+ if(!x.results||!x.results.length){trust(x,b);return}
 
  if(!x.resultsAreExactRoute){var w=document.createElement('div');w.className='sv';w.style.borderLeftColor='var(--warm)';
   w.innerHTML='<div style="font-size:.82rem">'+T('not_exact')+'</div>';b.appendChild(w)}
@@ -1127,9 +1745,10 @@ function trust(x,b){
  b.appendChild(d)}
 
 function explain(x){
- var b=$('aib');if(!b||!x.recommendation)return;
+ var b=$('aib');if(!b)return;
+ if(!x.recommendation&&!(x.answer&&(x.answer.kind==='estimate_only'||x.answer.kind==='action_plan')))return;
  fetch('/api/explain',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({recommendation:x.recommendation,savings:x.savings,context:x.context,lang:lang})})
+  body:JSON.stringify({recommendation:x.recommendation,savings:x.savings,context:x.context,answer:x.answer,lang:lang})})
  .then(function(r){return r.json()}).then(function(a){
   if(!a.text){b.innerHTML='';return}
   b.innerHTML='<div class="ai"><div class="l">AI</div>'+String(a.text).replace(/</g,'&lt;')+'</div>'})
@@ -1138,6 +1757,7 @@ function explain(x){
 (function(){var d=new Date();d.setDate(d.getDate()+14);var r=new Date(d);r.setDate(r.getDate()+4);
  $('dd').value=d.toISOString().slice(0,10);$('rd').value=r.toISOString().slice(0,10)})();
 ap();
+loadFeed();
 if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){})}
 })();
 </script></body></html>`;
